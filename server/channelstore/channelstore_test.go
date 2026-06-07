@@ -20,7 +20,7 @@ func TestGetChunkRoundTrip(t *testing.T) {
 	s = New(func(f *miragev1.ServerFrame) error {
 		sent <- f.GetChunkRequest()
 		return nil
-	})
+	}, nil)
 
 	type res struct {
 		data []byte
@@ -60,7 +60,7 @@ func TestGetChunkRejection(t *testing.T) {
 	s := New(func(f *miragev1.ServerFrame) error {
 		sent <- f.GetChunkRequest()
 		return nil
-	})
+	}, nil)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -87,7 +87,7 @@ func TestGetChunkHashVerification(t *testing.T) {
 	s := New(func(f *miragev1.ServerFrame) error {
 		sent <- f.GetChunkRequest()
 		return nil
-	})
+	}, nil)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -114,7 +114,7 @@ func TestGetChunkHashVerification(t *testing.T) {
 
 func TestGetChunkContextCancel(t *testing.T) {
 	h := chunk.HashOf([]byte("never answered"))
-	s := New(func(f *miragev1.ServerFrame) error { return nil })
+	s := New(func(f *miragev1.ServerFrame) error { return nil }, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)

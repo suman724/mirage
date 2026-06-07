@@ -13,14 +13,18 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 
 	"github.com/suman724/mirage/internal/chunk"
+	"github.com/suman724/mirage/internal/logging"
 	miragev1 "github.com/suman724/mirage/proto/mirage/v1"
 	"github.com/suman724/mirage/server/channelstore"
 )
@@ -43,12 +47,19 @@ type Server struct {
 	outDir    string
 	sandboxID string
 	onResult  func(Result)
+	log       *slog.Logger
 }
 
 // New returns a Server that reconstructs published trees into outDir. onResult
-// may be nil; if set it is invoked once per completed connection.
-func New(outDir string, onResult func(Result)) *Server {
-	return &Server{outDir: outDir, sandboxID: "mirage-sandbox-0", onResult: onResult}
+// may be nil; if set it is invoked once per completed connection. logger may be
+// nil (defaults to slog.Default()).
+func New(outDir string, onResult func(Result), logger *slog.Logger) *Server {
+	return &Server{
+		outDir:    outDir,
+		sandboxID: "mirage-sandbox-0",
+		onResult:  onResult,
+		log:       logging.OrDefault(logger),
+	}
 }
 
 // Register attaches the service to a gRPC server.
@@ -59,6 +70,11 @@ func (s *Server) Register(gs *grpc.Server) {
 // Connect handles one client-initiated bidi stream for its whole lifetime.
 func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 	ctx := stream.Context()
+	log := s.log
+	if p, ok := peerAddr(ctx); ok {
+		log = log.With("peer", p)
+	}
+	log.Info("client connected; accepting stream")
 
 	// Serialize all sends; both the recv loop (HelloAck) and the channelstore
 	// (ChunkRequest) write to the stream.
@@ -69,7 +85,7 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 		return stream.Send(f)
 	}
 
-	cs := channelstore.New(send)
+	cs := channelstore.New(send, log)
 	reconDone := make(chan Result, 1)
 	recvErr := make(chan error, 1)
 
@@ -82,43 +98,66 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 			}
 			switch p := frame.Payload.(type) {
 			case *miragev1.ClientFrame_Hello:
+				h := p.Hello
+				log.Info("received hello",
+					"client_version", h.GetClientVersion(),
+					"os", h.GetOs(),
+					"workspace", h.GetWorkspace().GetRootName())
 				if err := send(&miragev1.ServerFrame{
 					Payload: &miragev1.ServerFrame_HelloAck{
 						HelloAck: &miragev1.HelloAck{SandboxId: s.sandboxID},
 					},
 				}); err != nil {
-					recvErr <- err
+					recvErr <- fmt.Errorf("send HelloAck: %w", err)
 					return
 				}
 			case *miragev1.ClientFrame_IndexPublish:
-				manifest, err := chunk.Unmarshal(p.IndexPublish.GetCaidx())
+				ip := p.IndexPublish
+				manifest, err := chunk.Unmarshal(ip.GetCaidx())
 				if err != nil {
+					log.Error("failed to parse published index", "err", err)
 					reconDone <- Result{OutDir: s.outDir, Err: fmt.Errorf("parse index: %w", err)}
 					return
 				}
+				log.Info("index published; starting reconstruction",
+					"files", len(manifest.Files),
+					"total_chunks", ip.GetTotalChunks(),
+					"unique_chunks", len(manifest.UniqueHashes()),
+					"total_bytes", ip.GetTotalBytes(),
+					"out_dir", s.outDir)
 				go func() {
 					reconDone <- s.reconstruct(ctx, manifest, cs)
 				}()
 			case *miragev1.ClientFrame_ChunkResponse:
 				cs.Dispatch(p.ChunkResponse)
 			default:
-				// Heartbeats and out-of-scope frames are ignored this round.
+				log.Debug("ignoring out-of-scope client frame")
 			}
 		}
 	}()
 
 	select {
 	case res := <-reconDone:
+		if res.Err != nil {
+			log.Error("reconstruction failed",
+				"err", res.Err, "files", res.Files, "chunk_requests", res.ChunkRequests)
+		} else {
+			log.Info("reconstruction complete",
+				"files", res.Files, "bytes", res.Bytes, "chunk_requests", res.ChunkRequests)
+		}
 		if s.onResult != nil {
 			s.onResult(res)
 		}
 		return res.Err // returning closes the stream; client sees io.EOF
 	case err := <-recvErr:
 		if err == io.EOF {
+			log.Info("client closed the stream")
 			return nil
 		}
+		log.Error("stream receive error", "err", err)
 		return err
 	case <-ctx.Done():
+		log.Warn("connection context done", "err", ctx.Err())
 		return ctx.Err()
 	}
 }
@@ -126,9 +165,10 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 // reconstruct materializes every file in the manifest into outDir, fetching
 // each chunk's bytes over the channel via the channelstore.
 func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, cs *channelstore.Store) Result {
+	start := time.Now()
 	res := Result{OutDir: s.outDir}
 	if err := os.MkdirAll(s.outDir, 0o755); err != nil {
-		res.Err = err
+		res.Err = fmt.Errorf("transport: create out dir %q: %w", s.outDir, err)
 		res.ChunkRequests = cs.Requests()
 		return res
 	}
@@ -139,14 +179,14 @@ func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, cs *channel
 			break
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			res.Err = err
+			res.Err = fmt.Errorf("transport: create dir for %q: %w", f.Path, err)
 			break
 		}
-		var buf []byte
+		buf := make([]byte, 0, fileSize(f))
 		for _, ref := range f.Chunks {
 			data, err := cs.GetChunk(ctx, ref.Hash)
 			if err != nil {
-				res.Err = err
+				res.Err = fmt.Errorf("transport: fault chunk for %q: %w", f.Path, err)
 				break
 			}
 			buf = append(buf, data...)
@@ -159,14 +199,35 @@ func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, cs *channel
 			mode = 0o644
 		}
 		if err := os.WriteFile(dst, buf, mode); err != nil {
-			res.Err = err
+			res.Err = fmt.Errorf("transport: write %q: %w", f.Path, err)
 			break
 		}
+		s.log.Debug("reconstructed file", "path", f.Path, "bytes", len(buf), "chunks", len(f.Chunks))
 		res.Files++
 		res.Bytes += uint64(len(buf))
 	}
 	res.ChunkRequests = cs.Requests()
+	s.log.Debug("reconstruction pass finished",
+		"files", res.Files, "bytes", res.Bytes, "chunk_requests", res.ChunkRequests, "elapsed", time.Since(start))
 	return res
+}
+
+// fileSize sums a file entry's chunk sizes for buffer pre-allocation.
+func fileSize(f chunk.FileEntry) int {
+	var n int
+	for _, c := range f.Chunks {
+		n += int(c.Size)
+	}
+	return n
+}
+
+// peerAddr extracts the client's network address from the stream context, if
+// available, for logging.
+func peerAddr(ctx context.Context) (string, bool) {
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		return p.Addr.String(), true
+	}
+	return "", false
 }
 
 // safeJoin joins a relative path onto root, rejecting traversal outside root.

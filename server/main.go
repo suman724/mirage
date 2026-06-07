@@ -6,37 +6,50 @@ package main
 
 import (
 	"flag"
-	"log"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"google.golang.org/grpc"
 
+	"github.com/suman724/mirage/internal/logging"
 	"github.com/suman724/mirage/server/transport"
 )
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:7777", "listen address")
 	out := flag.String("out", "./mirage-out", "directory to reconstruct the workspace into")
+	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
+	logFormat := flag.String("log-format", "text", "log format: text|json")
 	flag.Parse()
+
+	log := logging.Setup(*logLevel, *logFormat)
 
 	lis, err := net.Listen("tcp", *addr)
 	if err != nil {
-		log.Fatalf("listen %s: %v", *addr, err)
+		log.Error("failed to listen", "addr", *addr, "err", err)
+		os.Exit(1)
 	}
 
 	gs := grpc.NewServer()
-	srv := transport.New(*out, func(r transport.Result) {
-		if r.Err != nil {
-			log.Printf("reconstruction FAILED after %d chunk requests: %v", r.ChunkRequests, r.Err)
-			return
-		}
-		log.Printf("reconstructed %d files (%d bytes) into %s via %d chunk requests over the stream",
-			r.Files, r.Bytes, r.OutDir, r.ChunkRequests)
-	})
+	srv := transport.New(*out, nil, log)
 	srv.Register(gs)
 
-	log.Printf("mirage-server listening on %s, reconstructing into %s (waiting for client to dial in)", *addr, *out)
+	// Graceful shutdown on SIGINT/SIGTERM.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-stop
+		log.Info("shutdown signal received; stopping gracefully", "signal", sig.String())
+		gs.GracefulStop()
+	}()
+
+	log.Info("mirage-server listening; waiting for client to dial in",
+		"addr", *addr, "out", *out)
 	if err := gs.Serve(lis); err != nil {
-		log.Fatalf("serve: %v", err)
+		log.Error("serve error", "err", err)
+		os.Exit(1)
 	}
+	log.Info("mirage-server stopped")
 }

@@ -13,6 +13,7 @@ package integration
 import (
 	"context"
 	"io/fs"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -26,6 +27,9 @@ import (
 	servertransport "github.com/suman724/mirage/server/transport"
 )
 
+// quietLogger discards log output so test runs stay readable.
+func quietLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
 func TestEndToEndReconstruction(t *testing.T) {
 	srcDir := filepath.Join("..", "testdata", "workspace")
 	outDir := t.TempDir()
@@ -37,12 +41,12 @@ func TestEndToEndReconstruction(t *testing.T) {
 	}
 	resultCh := make(chan servertransport.Result, 1)
 	gs := grpc.NewServer()
-	servertransport.New(outDir, func(r servertransport.Result) { resultCh <- r }).Register(gs)
+	servertransport.New(outDir, func(r servertransport.Result) { resultCh <- r }, quietLogger()).Register(gs)
 	go func() { _ = gs.Serve(lis) }()
 	defer gs.Stop()
 
 	// --- client: DIAL out, publish, serve chunks ---
-	c, err := clienttransport.Dial(lis.Addr().String())
+	c, err := clienttransport.Dial(lis.Addr().String(), quietLogger())
 	if err != nil {
 		t.Fatal(err)
 	}

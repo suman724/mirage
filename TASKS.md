@@ -83,8 +83,9 @@ dependency (macFUSE) we confront only after the foundation is solid.
 | 2.4 | Concurrency test: many concurrent `GetChunk` over one stream stay correct | ⬜ | Proves `request_id` multiplexing under desync's worker pool. |
 | 2.5 | FUSE mount (`hanwen/go-fuse`) on the server, backed by index → cache → channelstore; read faults chunks lazily | ⬜ | `server/fuse`. Gate 2.x: confirm mountability on this platform first. |
 | 2.6 | Harness stub: a process that `cat`s a file on the mount; assert correct bytes via faults, and a 2nd read hits cache | ⬜ | Non-interactive driver; the M2 "done when". |
-| 2.7 | Production hardening pass: structured logging (`log/slog`), context-aware errors, graceful shutdown, timeouts on every fetch | ⬜ | Non-negotiable across all of the above, not a final step. |
+| 2.7 | Production hardening pass: structured logging (`log/slog`), context-aware errors, graceful shutdown, timeouts on every fetch | ✅ | `internal/logging` (slog setup, level/format flags, nil-safe injection). Transports + channelstore log lifecycle/chunk events; errors wrapped with context; per-fetch timeout (`DefaultFetchTimeout`); server `GracefulStop` on SIGINT/SIGTERM; client cancels on signal. Remains the standard for new code. |
 | 2.8 | Keep README + CLAUDE.md + this file updated at each step | ⬜ | README gets a logical "how it works / how to use / who benefits" walkthrough. |
+| 2.9 | After the iteration's features are done, write a **plain-language tech doc** explaining everything we built, in logical order | ⬜ | Audience: a technologist with **no** prior knowledge of desync, content-defined chunking, or concurrency handling. Explain the concepts from first principles, then how Mirage uses them. Likely `docs/how-mirage-works.md`. |
 
 **Done when:** a stub harness reads `workspace/foo` on the FUSE mount, gets the
 correct bytes via on-demand `ChunkRequest`s, and a second read is served from
