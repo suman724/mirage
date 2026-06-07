@@ -26,6 +26,7 @@ import (
 	"github.com/suman724/mirage/internal/chunk"
 	"github.com/suman724/mirage/internal/logging"
 	miragev1 "github.com/suman724/mirage/proto/mirage/v1"
+	"github.com/suman724/mirage/server/cache"
 	"github.com/suman724/mirage/server/channelstore"
 )
 
@@ -36,7 +37,8 @@ type Result struct {
 	OutDir        string
 	Files         int
 	Bytes         uint64
-	ChunkRequests uint64 // ChunkRequests originated over the channel
+	ChunkRequests uint64 // ChunkRequests originated over the channel (cache misses)
+	CacheHits     uint64 // chunk reads served from the local cache
 	Err           error
 }
 
@@ -85,7 +87,10 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 		return stream.Send(f)
 	}
 
+	// Store chain: reconstruction reads through the local cache, which faults
+	// misses through the channelstore down the open stream (design §4.1).
 	cs := channelstore.New(send, log)
+	cacheStore := cache.New(cs, log)
 	reconDone := make(chan Result, 1)
 	recvErr := make(chan error, 1)
 
@@ -126,7 +131,7 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 					"total_bytes", ip.GetTotalBytes(),
 					"out_dir", s.outDir)
 				go func() {
-					reconDone <- s.reconstruct(ctx, manifest, cs)
+					reconDone <- s.reconstruct(ctx, manifest, cacheStore)
 				}()
 			case *miragev1.ClientFrame_ChunkResponse:
 				cs.Dispatch(p.ChunkResponse)
@@ -138,12 +143,17 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 
 	select {
 	case res := <-reconDone:
+		// Fill transport-level metrics: channel fetches (cache misses) vs hits.
+		res.ChunkRequests = cs.Requests()
+		res.CacheHits, _ = cacheStore.Stats()
 		if res.Err != nil {
 			log.Error("reconstruction failed",
-				"err", res.Err, "files", res.Files, "chunk_requests", res.ChunkRequests)
+				"err", res.Err, "files", res.Files,
+				"chunk_requests", res.ChunkRequests, "cache_hits", res.CacheHits)
 		} else {
 			log.Info("reconstruction complete",
-				"files", res.Files, "bytes", res.Bytes, "chunk_requests", res.ChunkRequests)
+				"files", res.Files, "bytes", res.Bytes,
+				"chunk_requests", res.ChunkRequests, "cache_hits", res.CacheHits)
 		}
 		if s.onResult != nil {
 			s.onResult(res)
@@ -162,14 +172,15 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 	}
 }
 
-// reconstruct materializes every file in the manifest into outDir, fetching
-// each chunk's bytes over the channel via the channelstore.
-func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, cs *channelstore.Store) Result {
+// reconstruct materializes every file in the manifest into outDir, faulting
+// each chunk's bytes through the provided store chain (cache -> channelstore).
+// Transport-level metrics (channel requests, cache hits) are filled by the
+// caller from the underlying stores.
+func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, store chunk.Store) Result {
 	start := time.Now()
 	res := Result{OutDir: s.outDir}
 	if err := os.MkdirAll(s.outDir, 0o755); err != nil {
 		res.Err = fmt.Errorf("transport: create out dir %q: %w", s.outDir, err)
-		res.ChunkRequests = cs.Requests()
 		return res
 	}
 	for _, f := range m.Files {
@@ -184,7 +195,7 @@ func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, cs *channel
 		}
 		buf := make([]byte, 0, fileSize(f))
 		for _, ref := range f.Chunks {
-			data, err := cs.GetChunk(ctx, ref.Hash)
+			data, err := store.GetChunk(ctx, ref.Hash)
 			if err != nil {
 				res.Err = fmt.Errorf("transport: fault chunk for %q: %w", f.Path, err)
 				break
@@ -206,9 +217,8 @@ func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, cs *channel
 		res.Files++
 		res.Bytes += uint64(len(buf))
 	}
-	res.ChunkRequests = cs.Requests()
 	s.log.Debug("reconstruction pass finished",
-		"files", res.Files, "bytes", res.Bytes, "chunk_requests", res.ChunkRequests, "elapsed", time.Since(start))
+		"files", res.Files, "bytes", res.Bytes, "elapsed", time.Since(start))
 	return res
 }
 

@@ -56,7 +56,9 @@ make vet fmt tidy
 | `client/index` | walks a dir, applies ignore + secret exclusion, chunks files → `(Manifest, chunkstore)`. |
 | `client/chunkstore` | published chunks by hash; `Get` returns `found=false` for unpublished hashes. |
 | `client/transport` | **the only Dialer.** Hello → IndexPublish → answer ChunkRequests. |
-| `server/channelstore` | `chunk.Store` over the stream: `GetChunk` sends a `ChunkRequest`, awaits the matching `ChunkResponse` (correlated by `request_id`), verifies bytes by hash. |
+| `server/channelstore` | `chunk.Store` over the stream: `GetChunk` sends a `ChunkRequest`, awaits the matching `ChunkResponse` (correlated by `request_id`), verifies bytes by hash, bounded by a per-fetch timeout. Safe for concurrent use. |
+| `server/cache` | in-memory `chunk.Store` fronting the channelstore (cache→channel chaining). Single-flight coalesces concurrent misses for the same hash. Tracks hits/misses. |
+| `internal/logging` | `log/slog` setup (level + text/json), nil-safe `OrDefault` injection for libraries. |
 | `server/transport` | accepts the stream, sends `HelloAck`, on `IndexPublish` reconstructs the tree via the channelstore into `--out`. Reports a `Result` (files, bytes, chunk-request count). |
 | `test/` | end-to-end over real localhost gRPC; asserts byte-identical trees and that secrets were never reconstructed. |
 

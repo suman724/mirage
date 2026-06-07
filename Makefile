@@ -36,6 +36,10 @@ test: ## run all unit + integration tests
 integration: ## run only the end-to-end integration test (verbose)
 	go test -v -run TestEndToEnd ./test/...
 
+.PHONY: test-race
+test-race: ## run all tests under the race detector
+	go test -race ./...
+
 .PHONY: vet
 vet: ## go vet
 	go vet ./...

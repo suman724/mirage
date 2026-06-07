@@ -30,6 +30,18 @@ import (
 // quietLogger discards log output so test runs stay readable.
 func quietLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
+// uniqueChunkCount indexes srcDir the same way the client does and returns the
+// number of distinct chunk hashes — the expected number of channel fetches once
+// the cache elides duplicates.
+func uniqueChunkCount(t *testing.T, srcDir string) int {
+	t.Helper()
+	m, _, err := index.Build(srcDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(m.UniqueHashes())
+}
+
 func TestEndToEndReconstruction(t *testing.T) {
 	srcDir := filepath.Join("..", "testdata", "workspace")
 	outDir := t.TempDir()
@@ -68,6 +80,19 @@ func TestEndToEndReconstruction(t *testing.T) {
 	// The server must have obtained data ONLY via the channel.
 	if result.ChunkRequests == 0 {
 		t.Fatal("server reconstructed without originating any ChunkRequest")
+	}
+
+	// testdata contains two byte-identical files (src/main.go, src/dup.go),
+	// which share a chunk. The local cache must serve the second occurrence,
+	// so there is at least one cache hit and fewer channel fetches than total
+	// chunk references.
+	if result.CacheHits == 0 {
+		t.Errorf("expected at least one cache hit from the duplicate file, got 0")
+	}
+	unique := uniqueChunkCount(t, srcDir)
+	if result.ChunkRequests != uint64(unique) {
+		t.Errorf("channel fetches = %d, want %d (one per unique chunk; cache elides duplicates)",
+			result.ChunkRequests, unique)
 	}
 
 	select {
