@@ -40,9 +40,8 @@ client/            DIALS OUT, indexes a dir, serves chunks by hash
   chunkstore/        holds published chunks; rejects unpublished hashes
   transport/         the ONLY package that Dials
 server/            ACCEPTS the connection, drives the protocol, reconstructs files
-  channelstore/      desync-style Store whose GetChunk() = ChunkRequest over the stream
-  cache/             in-memory chunk cache fronting the channelstore (cache->channel)
-  transport/         accepts the stream, originates ChunkRequests, writes files out
+  channelstore/      desync.Store whose GetChunk() = ChunkRequest over the stream
+  transport/         accepts the stream; store chain = desync Cache->DedupQueue->channelstore
 internal/logging/  structured log/slog setup shared by both binaries
 test/              end-to-end integration test over real localhost gRPC
 ```

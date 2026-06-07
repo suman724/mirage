@@ -24,9 +24,11 @@ originates requests *down the open stream*.
 - **Secret exclusion happens at index-build time** on the client
   (`client/index.IsSecret` + excluded dirs). Secret files are never chunked, so
   their chunks can never be requested. Don't move this enforcement server-side.
-- **The `chunk.Store` seam is sacred.** Everything fetches bytes via
-  `GetChunk(ctx, hash) ([]byte, error)`. Swapping the placeholder chunker for
-  `folbricht/desync` must stay local to `internal/chunk` + the store impls.
+- **Reuse desync; don't reinvent.** Before hand-rolling a primitive (cache,
+  dedup, assembly, FUSE, archive), check desync's API first — it already
+  provides most of it. Server components speak **`desync.Store`**
+  (`GetChunk(id) (*Chunk, error)`); the chunk store chain is
+  `Cache(DedupQueue(channelstore), LocalStore)`. See `docs/desync-reuse-review.md`.
 
 ## Build / test / generate
 
@@ -56,8 +58,8 @@ make vet fmt tidy
 | `client/index` | walks a dir, applies ignore + secret exclusion, chunks files → `(Manifest, chunkstore)`. |
 | `client/chunkstore` | published chunks by hash; `Get` returns `found=false` for unpublished hashes. |
 | `client/transport` | **the only Dialer.** Hello → IndexPublish → answer ChunkRequests. |
-| `server/channelstore` | `chunk.Store` over the stream: `GetChunk` sends a `ChunkRequest`, awaits the matching `ChunkResponse` (correlated by `request_id`), verifies bytes by hash, bounded by a per-fetch timeout. Safe for concurrent use. |
-| `server/cache` | in-memory `chunk.Store` fronting the channelstore (cache→channel chaining). Single-flight coalesces concurrent misses for the same hash. Tracks hits/misses. |
+| `server/channelstore` | implements **`desync.Store`** over the stream: `GetChunk(id)` sends a `ChunkRequest`, awaits the matching `ChunkResponse` (correlated by `request_id`), returns a verified `desync.Chunk` (`NewChunkWithID`). No ctx in the signature (desync's interface) — the stream context + per-fetch timeout live inside the store. Safe for concurrent use. |
+| `server/transport` store chain | reuses desync: `desync.NewCache(desync.NewDedupQueue(channelstore), LocalStore)` — local disk cache → single-flight → channel. No bespoke cache (see `docs/desync-reuse-review.md`). |
 | `internal/logging` | `log/slog` setup (level + text/json), nil-safe `OrDefault` injection for libraries. |
 | `server/transport` | accepts the stream, sends `HelloAck`, on `IndexPublish` reconstructs the tree via the channelstore into `--out`. Reports a `Result` (files, bytes, chunk-request count). |
 | `test/` | end-to-end over real localhost gRPC; asserts byte-identical trees and that secrets were never reconstructed. |

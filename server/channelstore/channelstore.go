@@ -1,4 +1,4 @@
-// Package channelstore implements chunk.Store on the SERVER side by fetching
+// Package channelstore implements desync.Store on the SERVER side by fetching
 // chunk bytes over the already-open gRPC stream that the client dialed.
 //
 // This is the core bridge described in design §4.1: a Store whose GetChunk
@@ -7,10 +7,17 @@
 // where "lazy filesystem" meets "outbound-only socket". The server never
 // dials; it only originates requests over the open stream.
 //
-// Requests are correlated to responses by request_id. The transport layer
-// feeds incoming ChunkResponses to Dispatch; GetChunk blocks on the matching
-// reply. GetChunk is safe for concurrent use — desync's assembler (and, later,
-// concurrent FUSE reads) fan out many GetChunk calls that all multiplex over
+// It implements desync.Store (not a bespoke interface) so the rest of the
+// server can reuse desync's machinery — Cache, DedupQueue, AssembleFile, the
+// FUSE read path — instead of re-implementing it. desync's Store signature has
+// no context.Context, so cancellation and per-fetch timeout are handled
+// internally from the stream context (the same approach desync's own HTTP
+// store takes). Returning a desync *Chunk via NewChunkWithID also gives us
+// hash verification for free.
+//
+// Requests are correlated to responses by request_id. The transport feeds
+// incoming ChunkResponses to Dispatch; GetChunk blocks on the matching reply.
+// GetChunk is safe for concurrent use — many overlapping faults multiplex over
 // the single stream via request_id correlation.
 package channelstore
 
@@ -22,7 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/suman724/mirage/internal/chunk"
+	"github.com/folbricht/desync"
+
 	"github.com/suman724/mirage/internal/logging"
 	miragev1 "github.com/suman724/mirage/proto/mirage/v1"
 )
@@ -35,8 +43,9 @@ const DefaultFetchTimeout = 30 * time.Second
 // call; the transport serializes concurrent sends.
 type SendFunc func(*miragev1.ServerFrame) error
 
-// Store fetches chunks over the channel. It implements chunk.Store.
+// Store fetches chunks over the channel. It implements desync.Store.
 type Store struct {
+	ctx          context.Context // stream context; cancels in-flight fetches on disconnect
 	send         SendFunc
 	log          *slog.Logger
 	fetchTimeout time.Duration
@@ -47,10 +56,14 @@ type Store struct {
 	pending map[uint64]chan *miragev1.ChunkResponse
 }
 
-// New returns a Store that originates ChunkRequests via send. logger may be nil
-// (defaults to slog.Default()).
-func New(send SendFunc, logger *slog.Logger) *Store {
+var _ desync.Store = (*Store)(nil)
+
+// New returns a Store that originates ChunkRequests via send. ctx is the stream
+// context: when it is cancelled (the connection drops), in-flight fetches fail.
+// logger may be nil (defaults to slog.Default()).
+func New(ctx context.Context, send SendFunc, logger *slog.Logger) *Store {
 	return &Store{
+		ctx:          ctx,
 		send:         send,
 		log:          logging.OrDefault(logger),
 		fetchTimeout: DefaultFetchTimeout,
@@ -58,69 +71,81 @@ func New(send SendFunc, logger *slog.Logger) *Store {
 	}
 }
 
-// Requests returns how many ChunkRequests this store has originated. Used to
-// prove the server obtained data only via the channel.
+// Requests returns how many ChunkRequests this store has originated. With a
+// cache/dedup layer in front, this equals the number of distinct chunks
+// actually fetched over the wire. Used to prove the server obtained data only
+// via the channel.
 func (s *Store) Requests() uint64 { return s.reqs.Load() }
 
-// GetChunk sends a ChunkRequest for h and waits for the matching response,
-// bounded by the store's fetch timeout and the caller's context.
-func (s *Store) GetChunk(ctx context.Context, h chunk.Hash) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.fetchTimeout)
+// GetChunk sends a ChunkRequest for id and waits for the matching response,
+// bounded by the store's fetch timeout and the stream context. It implements
+// desync.Store.
+func (s *Store) GetChunk(id desync.ChunkID) (*desync.Chunk, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, s.fetchTimeout)
 	defer cancel()
 
-	id := s.nextID.Add(1)
+	reqID := s.nextID.Add(1)
 	ch := make(chan *miragev1.ChunkResponse, 1)
 
 	s.mu.Lock()
-	s.pending[id] = ch
+	s.pending[reqID] = ch
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
-		delete(s.pending, id)
+		delete(s.pending, reqID)
 		s.mu.Unlock()
 	}()
 
 	s.reqs.Add(1)
-	s.log.Debug("requesting chunk over channel", "request_id", id, "hash", h.String())
+	s.log.Debug("requesting chunk over channel", "request_id", reqID, "chunk", id.String())
 	frame := &miragev1.ServerFrame{
 		Payload: &miragev1.ServerFrame_ChunkRequest{
 			ChunkRequest: &miragev1.ChunkRequest{
-				RequestId:   id,
-				ChunkHashes: [][]byte{h[:]},
+				RequestId:   reqID,
+				ChunkHashes: [][]byte{id[:]},
 			},
 		},
 	}
 	if err := s.send(frame); err != nil {
-		return nil, fmt.Errorf("channelstore: send ChunkRequest %d for %s: %w", id, h, err)
+		return nil, fmt.Errorf("channelstore: send ChunkRequest %d for %s: %w", reqID, id, err)
 	}
 
 	select {
 	case <-ctx.Done():
-		s.log.Warn("chunk fetch aborted", "request_id", id, "hash", h.String(), "err", ctx.Err())
-		return nil, fmt.Errorf("channelstore: fetch chunk %s (request %d): %w", h, id, ctx.Err())
+		s.log.Warn("chunk fetch aborted", "request_id", reqID, "chunk", id.String(), "err", ctx.Err())
+		return nil, fmt.Errorf("channelstore: fetch chunk %s (request %d): %w", id, reqID, ctx.Err())
 	case resp := <-ch:
 		if resp.GetError() != "" {
-			return nil, fmt.Errorf("channelstore: client rejected chunk %s (request %d): %s", h, id, resp.GetError())
+			return nil, fmt.Errorf("channelstore: client rejected chunk %s (request %d): %s", id, reqID, resp.GetError())
 		}
 		for _, c := range resp.GetChunks() {
-			got, err := chunk.HashFromBytes(c.GetHash())
-			if err != nil {
-				return nil, fmt.Errorf("channelstore: response %d: %w", id, err)
-			}
-			if got != h {
+			if !chunkIDEqual(c.GetHash(), id) {
 				continue
 			}
-			data := c.GetData()
-			// Verify the client served the bytes we actually asked for.
-			if chunk.HashOf(data) != h {
-				return nil, fmt.Errorf("channelstore: chunk %s (request %d) failed hash verification", h, id)
+			// NewChunkWithID verifies the bytes hash to id (skipVerify=false).
+			ck, err := desync.NewChunkWithID(id, c.GetData(), false)
+			if err != nil {
+				return nil, fmt.Errorf("channelstore: chunk %s (request %d): %w", id, reqID, err)
 			}
-			s.log.Debug("received chunk over channel", "request_id", id, "hash", h.String(), "bytes", len(data))
-			return data, nil
+			s.log.Debug("received chunk over channel", "request_id", reqID, "chunk", id.String(), "bytes", len(c.GetData()))
+			return ck, nil
 		}
-		return nil, fmt.Errorf("channelstore: response %d missing requested chunk %s", id, h)
+		return nil, fmt.Errorf("channelstore: response %d missing requested chunk %s", reqID, id)
 	}
 }
+
+// HasChunk reports whether the store can serve id. The server only ever
+// requests hashes present in the published index, so this is always true; the
+// real existence/authorization check is enforced on the client, which rejects
+// unpublished hashes. It implements desync.Store.
+func (s *Store) HasChunk(id desync.ChunkID) (bool, error) { return true, nil }
+
+// Close implements desync.Store. The stream lifecycle is owned by the
+// transport, so there is nothing to release here.
+func (s *Store) Close() error { return nil }
+
+// String implements desync.Store (fmt.Stringer).
+func (s *Store) String() string { return "mirage-channelstore" }
 
 // Dispatch routes a ChunkResponse to the GetChunk call waiting on its
 // request_id. Unknown ids are dropped (logged at debug) — they can occur if a
@@ -134,4 +159,17 @@ func (s *Store) Dispatch(resp *miragev1.ChunkResponse) {
 		return
 	}
 	s.log.Debug("dropping response for unknown/expired request", "request_id", resp.GetRequestId())
+}
+
+// chunkIDEqual reports whether a raw wire hash equals a desync ChunkID.
+func chunkIDEqual(raw []byte, id desync.ChunkID) bool {
+	if len(raw) != len(id) {
+		return false
+	}
+	for i := range id {
+		if raw[i] != id[i] {
+			return false
+		}
+	}
+	return true
 }

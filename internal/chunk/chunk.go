@@ -8,15 +8,14 @@
 // desync chunk IDs (SHA-512/256, desync's default digest). This is the real
 // chunker, not a placeholder.
 //
-// The Store seam (GetChunk(hash) -> bytes) is the integration boundary between
-// "lazy filesystem" and "outbound-only socket": the server's channelstore
-// implements it over the gRPC stream, the client's chunkstore implements it
-// from local memory. A desync-native store can be adapted to this shape too.
+// Chunk fetching is abstracted by desync.Store (GetChunk(id) -> *Chunk): the
+// server's channelstore implements it over the gRPC stream, and desync's own
+// Cache / DedupQueue / LocalStore are layered on top. The manifest below is our
+// small path->chunks index; chunk *contents* are faulted lazily via that store.
 package chunk
 
 import (
 	"bytes"
-	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -167,11 +166,4 @@ func Split(data []byte) ([]Ref, map[Hash][]byte, error) {
 		}
 	}
 	return refs, chunks, nil
-}
-
-// Store is the integration seam: fetch a chunk's bytes by content hash. The
-// server's channelstore implements this over the gRPC stream; the client's
-// chunkstore implements it from local memory.
-type Store interface {
-	GetChunk(ctx context.Context, h Hash) ([]byte, error)
 }

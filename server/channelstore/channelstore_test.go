@@ -8,19 +8,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/suman724/mirage/internal/chunk"
+	"github.com/folbricht/desync"
+
 	miragev1 "github.com/suman724/mirage/proto/mirage/v1"
 )
 
-// drive runs GetChunk concurrently, capturing the outgoing ChunkRequest so the
-// test can craft a matching response.
+// chunkID returns the desync chunk ID for data (matches what the client stores).
+func chunkID(data []byte) desync.ChunkID { return desync.Digest.Sum(data) }
+
 func TestGetChunkRoundTrip(t *testing.T) {
 	data := []byte("the chunk bytes")
-	h := chunk.HashOf(data)
+	id := chunkID(data)
 
 	sent := make(chan *miragev1.ChunkRequest, 1)
-	var s *Store
-	s = New(func(f *miragev1.ServerFrame) error {
+	s := New(context.Background(), func(f *miragev1.ServerFrame) error {
 		sent <- f.GetChunkRequest()
 		return nil
 	}, nil)
@@ -31,7 +32,12 @@ func TestGetChunkRoundTrip(t *testing.T) {
 	}
 	done := make(chan res, 1)
 	go func() {
-		b, err := s.GetChunk(context.Background(), h)
+		ck, err := s.GetChunk(id)
+		if err != nil {
+			done <- res{nil, err}
+			return
+		}
+		b, err := ck.Data()
 		done <- res{b, err}
 	}()
 
@@ -41,7 +47,7 @@ func TestGetChunkRoundTrip(t *testing.T) {
 	}
 	s.Dispatch(&miragev1.ChunkResponse{
 		RequestId: req.GetRequestId(),
-		Chunks:    []*miragev1.Chunk{{Hash: h[:], Data: data}},
+		Chunks:    []*miragev1.Chunk{{Hash: id[:], Data: data}},
 	})
 
 	select {
@@ -58,16 +64,16 @@ func TestGetChunkRoundTrip(t *testing.T) {
 }
 
 func TestGetChunkRejection(t *testing.T) {
-	h := chunk.HashOf([]byte("secret"))
+	id := chunkID([]byte("secret"))
 	sent := make(chan *miragev1.ChunkRequest, 1)
-	s := New(func(f *miragev1.ServerFrame) error {
+	s := New(context.Background(), func(f *miragev1.ServerFrame) error {
 		sent <- f.GetChunkRequest()
 		return nil
 	}, nil)
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := s.GetChunk(context.Background(), h)
+		_, err := s.GetChunk(id)
 		errCh <- err
 	}()
 
@@ -85,24 +91,25 @@ func TestGetChunkRejection(t *testing.T) {
 }
 
 func TestGetChunkHashVerification(t *testing.T) {
-	h := chunk.HashOf([]byte("expected"))
+	id := chunkID([]byte("expected"))
 	sent := make(chan *miragev1.ChunkRequest, 1)
-	s := New(func(f *miragev1.ServerFrame) error {
+	s := New(context.Background(), func(f *miragev1.ServerFrame) error {
 		sent <- f.GetChunkRequest()
 		return nil
 	}, nil)
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := s.GetChunk(context.Background(), h)
+		_, err := s.GetChunk(id)
 		errCh <- err
 	}()
 
 	req := <-sent
-	// Server claims hash h but sends tampered bytes -> must fail verification.
+	// Server claims id but sends tampered bytes -> desync NewChunkWithID must
+	// fail verification.
 	s.Dispatch(&miragev1.ChunkResponse{
 		RequestId: req.GetRequestId(),
-		Chunks:    []*miragev1.Chunk{{Hash: h[:], Data: []byte("tampered")}},
+		Chunks:    []*miragev1.Chunk{{Hash: id[:], Data: []byte("tampered")}},
 	})
 
 	select {
@@ -117,20 +124,19 @@ func TestGetChunkHashVerification(t *testing.T) {
 
 // TestGetChunkConcurrent proves that many concurrent GetChunk calls multiplex
 // correctly over the single stream: each caller gets the bytes for its own
-// hash, never another's, even when responses arrive interleaved and out of
+// chunk, never another's, even when responses arrive interleaved and out of
 // order. This is the property desync's concurrent assembler (and concurrent
 // FUSE reads) rely on.
 func TestGetChunkConcurrent(t *testing.T) {
-	// Distinct chunks keyed by content.
 	const n = 200
-	want := make(map[chunk.Hash][]byte, n)
+	want := make(map[desync.ChunkID][]byte, n)
 	for i := 0; i < n; i++ {
 		data := []byte("chunk-number-" + strconv.Itoa(i))
-		want[chunk.HashOf(data)] = data
+		want[chunkID(data)] = data
 	}
 
 	requests := make(chan *miragev1.ChunkRequest, n)
-	s := New(func(f *miragev1.ServerFrame) error {
+	s := New(context.Background(), func(f *miragev1.ServerFrame) error {
 		requests <- f.GetChunkRequest()
 		return nil
 	}, nil)
@@ -141,10 +147,11 @@ func TestGetChunkConcurrent(t *testing.T) {
 		for req := range requests {
 			req := req
 			go func() {
-				h, _ := chunk.HashFromBytes(req.GetChunkHashes()[0])
+				var id desync.ChunkID
+				copy(id[:], req.GetChunkHashes()[0])
 				s.Dispatch(&miragev1.ChunkResponse{
 					RequestId: req.GetRequestId(),
-					Chunks:    []*miragev1.Chunk{{Hash: h[:], Data: want[h]}},
+					Chunks:    []*miragev1.Chunk{{Hash: id[:], Data: want[id]}},
 				})
 			}()
 		}
@@ -152,16 +159,22 @@ func TestGetChunkConcurrent(t *testing.T) {
 
 	var wg sync.WaitGroup
 	var fail atomic.Bool
-	for h, data := range want {
+	for id, data := range want {
 		wg.Add(1)
-		go func(h chunk.Hash, data []byte) {
+		go func(id desync.ChunkID, data []byte) {
 			defer wg.Done()
-			got, err := s.GetChunk(context.Background(), h)
+			ck, err := s.GetChunk(id)
+			if err != nil {
+				fail.Store(true)
+				t.Errorf("chunk %s: %v", id, err)
+				return
+			}
+			got, err := ck.Data()
 			if err != nil || string(got) != string(data) {
 				fail.Store(true)
-				t.Errorf("hash %s: got %q err %v, want %q", h, got, err, data)
+				t.Errorf("chunk %s: got %q err %v, want %q", id, got, err, data)
 			}
-		}(h, data)
+		}(id, data)
 	}
 	wg.Wait()
 	close(requests)
@@ -175,16 +188,18 @@ func TestGetChunkConcurrent(t *testing.T) {
 }
 
 func TestGetChunkContextCancel(t *testing.T) {
-	h := chunk.HashOf([]byte("never answered"))
-	s := New(func(f *miragev1.ServerFrame) error { return nil }, nil)
-
+	id := chunkID([]byte("never answered"))
+	// A store whose stream context is already cancelled: the fetch must fail
+	// promptly rather than block on a response that will never come.
 	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s := New(ctx, func(f *miragev1.ServerFrame) error { return nil }, nil)
+
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := s.GetChunk(ctx, h)
+		_, err := s.GetChunk(id)
 		errCh <- err
 	}()
-	cancel()
 
 	select {
 	case err := <-errCh:

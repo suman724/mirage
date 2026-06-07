@@ -20,13 +20,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/folbricht/desync"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/peer"
 
 	"github.com/suman724/mirage/internal/chunk"
 	"github.com/suman724/mirage/internal/logging"
 	miragev1 "github.com/suman724/mirage/proto/mirage/v1"
-	"github.com/suman724/mirage/server/cache"
 	"github.com/suman724/mirage/server/channelstore"
 )
 
@@ -37,8 +37,9 @@ type Result struct {
 	OutDir        string
 	Files         int
 	Bytes         uint64
-	ChunkRequests uint64 // ChunkRequests originated over the channel (cache misses)
-	CacheHits     uint64 // chunk reads served from the local cache
+	TotalRefs     uint64 // total chunk references across all files (with duplicates)
+	ChunkRequests uint64 // ChunkRequests originated over the channel (distinct chunks faulted)
+	CacheHits     uint64 // chunk reads served from the local cache (duplicates)
 	Err           error
 }
 
@@ -87,10 +88,24 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 		return stream.Send(f)
 	}
 
-	// Store chain: reconstruction reads through the local cache, which faults
-	// misses through the channelstore down the open stream (design §4.1).
-	cs := channelstore.New(send, log)
-	cacheStore := cache.New(cs, log)
+	// Store chain (design §4.1, reusing desync): reconstruction reads through a
+	// local disk Cache, whose misses fall through a DedupQueue (single-flight)
+	// to the channelstore, which faults the chunk down the open stream.
+	//   cache(local) -> dedup -> channelstore -> ChunkRequest over the wire
+	cs := channelstore.New(ctx, send, log)
+	cacheDir, err := os.MkdirTemp("", "mirage-cache-")
+	if err != nil {
+		log.Error("failed to create chunk cache dir", "err", err)
+		return fmt.Errorf("transport: create cache dir: %w", err)
+	}
+	defer os.RemoveAll(cacheDir)
+	localCache, err := desync.NewLocalStore(cacheDir, desync.StoreOptions{})
+	if err != nil {
+		log.Error("failed to open local chunk cache", "dir", cacheDir, "err", err)
+		return fmt.Errorf("transport: open local cache: %w", err)
+	}
+	storeChain := desync.NewCache(desync.NewDedupQueue(cs), localCache)
+
 	reconDone := make(chan Result, 1)
 	recvErr := make(chan error, 1)
 
@@ -131,7 +146,7 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 					"total_bytes", ip.GetTotalBytes(),
 					"out_dir", s.outDir)
 				go func() {
-					reconDone <- s.reconstruct(ctx, manifest, cacheStore)
+					reconDone <- s.reconstruct(ctx, manifest, storeChain)
 				}()
 			case *miragev1.ClientFrame_ChunkResponse:
 				cs.Dispatch(p.ChunkResponse)
@@ -143,9 +158,14 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 
 	select {
 	case res := <-reconDone:
-		// Fill transport-level metrics: channel fetches (cache misses) vs hits.
+		// Fill transport-level metrics: channel fetches (= distinct chunks
+		// faulted over the wire) vs cache hits (refs served from the local
+		// cache, i.e. duplicates). desync.Cache exposes no counters, so derive
+		// hits from total refs minus channel fetches.
 		res.ChunkRequests = cs.Requests()
-		res.CacheHits, _ = cacheStore.Stats()
+		if res.TotalRefs >= res.ChunkRequests {
+			res.CacheHits = res.TotalRefs - res.ChunkRequests
+		}
 		if res.Err != nil {
 			log.Error("reconstruction failed",
 				"err", res.Err, "files", res.Files,
@@ -173,17 +193,21 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 }
 
 // reconstruct materializes every file in the manifest into outDir, faulting
-// each chunk's bytes through the provided store chain (cache -> channelstore).
-// Transport-level metrics (channel requests, cache hits) are filled by the
-// caller from the underlying stores.
-func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, store chunk.Store) Result {
+// each chunk's bytes through the provided desync store chain (cache -> dedup ->
+// channelstore). Transport-level metrics (channel requests, cache hits) are
+// filled by the caller from the underlying channelstore.
+func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, store desync.Store) Result {
 	start := time.Now()
-	res := Result{OutDir: s.outDir}
+	res := Result{OutDir: s.outDir, TotalRefs: uint64(m.TotalChunks())}
 	if err := os.MkdirAll(s.outDir, 0o755); err != nil {
 		res.Err = fmt.Errorf("transport: create out dir %q: %w", s.outDir, err)
 		return res
 	}
 	for _, f := range m.Files {
+		if err := ctx.Err(); err != nil {
+			res.Err = fmt.Errorf("transport: reconstruction cancelled: %w", err)
+			break
+		}
 		dst, err := safeJoin(s.outDir, f.Path)
 		if err != nil {
 			res.Err = err
@@ -195,9 +219,14 @@ func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, store chunk
 		}
 		buf := make([]byte, 0, fileSize(f))
 		for _, ref := range f.Chunks {
-			data, err := store.GetChunk(ctx, ref.Hash)
+			ck, err := store.GetChunk(desync.ChunkID(ref.Hash))
 			if err != nil {
 				res.Err = fmt.Errorf("transport: fault chunk for %q: %w", f.Path, err)
+				break
+			}
+			data, err := ck.Data()
+			if err != nil {
+				res.Err = fmt.Errorf("transport: decode chunk for %q: %w", f.Path, err)
 				break
 			}
 			buf = append(buf, data...)
