@@ -1,29 +1,40 @@
 // Package chunk holds the content-addressed chunking primitives shared by the
-// Mirage client and server: the hash type, the per-tree manifest (our stand-in
-// for a desync .caidx), a trivial fixed-size SHA-256 chunker, and the Store
-// seam.
+// Mirage client and server: the hash type, the per-tree manifest, the
+// content-defined chunker, and the Store seam.
 //
-// PLACEHOLDER NOTE: the chunker here is a fixed-size SHA-256 splitter, not
-// desync's content-defined chunking. It exists so the first end-to-end spike
-// does not block on desync integration. The important part is the Store seam
-// (GetChunk(hash) -> bytes): swapping in folbricht/desync later means
-// implementing Store with desync's chunker + index and is a local change that
-// does not touch the transport or reconstruction code.
+// Chunking and content hashing are backed by folbricht/desync: Split uses
+// desync's content-defined chunker (CDC), so identical content anywhere in the
+// tree — or across files — collapses to the same chunk, and chunk IDs are
+// desync chunk IDs (SHA-512/256, desync's default digest). This is the real
+// chunker, not a placeholder.
+//
+// The Store seam (GetChunk(hash) -> bytes) is the integration boundary between
+// "lazy filesystem" and "outbound-only socket": the server's channelstore
+// implements it over the gRPC stream, the client's chunkstore implements it
+// from local memory. A desync-native store can be adapted to this shape too.
 package chunk
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+
+	"github.com/folbricht/desync"
 )
 
-// ChunkSize is the fixed chunk size for the placeholder chunker (64 KiB).
-const ChunkSize = 64 * 1024
+// Content-defined chunking parameters (bytes). These follow casync/desync
+// conventions: a 64 KiB average with a 4x window on either side. Tuning these
+// trades fault count against dedup ratio (design §8, open question 2).
+const (
+	ChunkMin = 16 * 1024  // 16 KiB
+	ChunkAvg = 64 * 1024  // 64 KiB
+	ChunkMax = 256 * 1024 // 256 KiB
+)
 
-// Hash is a content hash (SHA-256) identifying a chunk. It marshals to/from hex
-// in JSON so manifests are human-readable.
+// Hash is a content hash identifying a chunk: a desync chunk ID (SHA-512/256).
+// It marshals to/from hex in JSON so manifests are human-readable.
 type Hash [32]byte
 
 // String returns the hex encoding of the hash.
@@ -47,9 +58,10 @@ func (h *Hash) UnmarshalText(text []byte) error {
 	return nil
 }
 
-// HashOf computes the content hash of a chunk's bytes.
+// HashOf computes the content hash of a chunk's bytes using desync's digest, so
+// it matches the chunk IDs produced by Split.
 func HashOf(data []byte) Hash {
-	return Hash(sha256.Sum256(data))
+	return Hash(desync.Digest.Sum(data))
 }
 
 // HashFromBytes converts a raw wire hash (proto bytes) to a Hash.
@@ -77,9 +89,8 @@ type FileEntry struct {
 }
 
 // Manifest is the published index: which files exist and which chunks compose
-// them. It is the analogue of a desync directory index (.caidx). It is tiny
-// relative to the tree and is sent up front; chunk *contents* are faulted
-// lazily afterward.
+// them. It is tiny relative to the tree and is sent up front; chunk *contents*
+// are faulted lazily afterward.
 type Manifest struct {
 	Files []FileEntry `json:"files"`
 }
@@ -127,32 +138,40 @@ func (m *Manifest) UniqueHashes() map[Hash]struct{} {
 	return set
 }
 
-// Split applies the placeholder fixed-size chunker to data, returning the
-// ordered chunk refs and a map of hash -> bytes for the distinct chunks.
-func Split(data []byte) ([]Ref, map[Hash][]byte) {
-	refs := make([]Ref, 0, len(data)/ChunkSize+1)
+// Split applies desync's content-defined chunker to data, returning the ordered
+// chunk refs and a map of hash -> bytes for the distinct chunks. Concatenating
+// the chunk bytes in ref order reproduces the input exactly.
+func Split(data []byte) ([]Ref, map[Hash][]byte, error) {
+	c, err := desync.NewChunker(bytes.NewReader(data), ChunkMin, ChunkAvg, ChunkMax)
+	if err != nil {
+		return nil, nil, fmt.Errorf("chunk: new chunker: %w", err)
+	}
+	refs := make([]Ref, 0, len(data)/ChunkAvg+1)
 	chunks := make(map[Hash][]byte)
-	for off := 0; off < len(data); off += ChunkSize {
-		end := off + ChunkSize
-		if end > len(data) {
-			end = len(data)
+	for {
+		_, buf, err := c.Next()
+		if err != nil {
+			return nil, nil, fmt.Errorf("chunk: split: %w", err)
 		}
-		// Copy so callers can mutate the source buffer safely.
-		buf := make([]byte, end-off)
-		copy(buf, data[off:end])
-		h := HashOf(buf)
-		refs = append(refs, Ref{Hash: h, Size: uint32(len(buf))})
+		if len(buf) == 0 {
+			break // end of stream
+		}
+		// desync reuses its internal buffer across Next calls; copy so the
+		// chunk bytes stay valid after the next iteration.
+		b := make([]byte, len(buf))
+		copy(b, buf)
+		h := HashOf(b)
+		refs = append(refs, Ref{Hash: h, Size: uint32(len(b))})
 		if _, ok := chunks[h]; !ok {
-			chunks[h] = buf
+			chunks[h] = b
 		}
 	}
-	return refs, chunks
+	return refs, chunks, nil
 }
 
 // Store is the integration seam: fetch a chunk's bytes by content hash. The
 // server's channelstore implements this over the gRPC stream; the client's
-// chunkstore implements it from local memory. desync's own Store can be
-// adapted to this shape later.
+// chunkstore implements it from local memory.
 type Store interface {
 	GetChunk(ctx context.Context, h Hash) ([]byte, error)
 }

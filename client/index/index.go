@@ -92,7 +92,10 @@ func Build(root string) (*chunk.Manifest, *chunkstore.Store, error) {
 			return err
 		}
 
-		refs, chunks := chunk.Split(data)
+		refs, chunks, err := chunk.Split(data)
+		if err != nil {
+			return fmt.Errorf("chunk %s: %w", rel, err)
+		}
 		for h, b := range chunks {
 			store.Put(h, b)
 		}

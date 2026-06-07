@@ -6,12 +6,26 @@ import (
 	"testing"
 )
 
-func TestSplitDeterministicAndDedup(t *testing.T) {
-	data := bytes.Repeat([]byte("abcd"), ChunkSize) // > 1 chunk, with repetition
+func TestSplitDeterministicAndReassembles(t *testing.T) {
+	// ~1 MiB of varied content so CDC produces several chunks.
+	data := make([]byte, 1<<20)
+	for i := range data {
+		data[i] = byte(i*31 + i/7)
+	}
 
-	refs1, chunks1 := Split(data)
-	refs2, _ := Split(data)
+	refs1, chunks1, err := Split(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs2, _, err := Split(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs1) < 2 {
+		t.Fatalf("expected multiple chunks for 1 MiB input, got %d", len(refs1))
+	}
 
+	// Chunking must be deterministic.
 	if len(refs1) != len(refs2) {
 		t.Fatalf("non-deterministic ref count: %d vs %d", len(refs1), len(refs2))
 	}
@@ -28,6 +42,9 @@ func TestSplitDeterministicAndDedup(t *testing.T) {
 		if !ok {
 			t.Fatalf("ref hash %s missing from chunk map", r.Hash)
 		}
+		if uint32(len(b)) != r.Size {
+			t.Fatalf("chunk size %d != ref size %d", len(b), r.Size)
+		}
 		got = append(got, b...)
 	}
 	if !bytes.Equal(got, data) {
@@ -35,20 +52,39 @@ func TestSplitDeterministicAndDedup(t *testing.T) {
 	}
 }
 
-func TestSplitDedupIdenticalChunks(t *testing.T) {
-	// Two full chunks of identical content -> one distinct chunk, two refs.
-	block := bytes.Repeat([]byte("x"), ChunkSize)
-	data := append(append([]byte{}, block...), block...)
+func TestSplitDedupsRepeatedContent(t *testing.T) {
+	// Highly repetitive content must dedup: many refs collapse to far fewer
+	// distinct chunks. (CDC cuts repeated regions identically.)
+	data := bytes.Repeat([]byte("mirage"), 1<<18) // ~1.5 MiB
 
-	refs, chunks := Split(data)
-	if len(refs) != 2 {
-		t.Fatalf("want 2 refs, got %d", len(refs))
+	refs, chunks, err := Split(data)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(chunks) != 1 {
-		t.Fatalf("want 1 distinct chunk after dedup, got %d", len(chunks))
+	if len(refs) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(refs))
 	}
-	if refs[0].Hash != refs[1].Hash {
-		t.Fatalf("identical content produced different hashes")
+	if len(chunks) >= len(refs) {
+		t.Fatalf("expected dedup (distinct %d < refs %d)", len(chunks), len(refs))
+	}
+
+	// Still reassembles exactly.
+	var got []byte
+	for _, r := range refs {
+		got = append(got, chunks[r.Hash]...)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("reassembled bytes != original")
+	}
+}
+
+func TestSplitEmpty(t *testing.T) {
+	refs, chunks, err := Split(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 0 || len(chunks) != 0 {
+		t.Fatalf("empty input should yield no chunks, got %d refs / %d chunks", len(refs), len(chunks))
 	}
 }
 
@@ -82,8 +118,14 @@ func TestHashFromBytes(t *testing.T) {
 }
 
 func TestManifestRoundTripAndTotals(t *testing.T) {
-	refsA, _ := Split([]byte("file A content"))
-	refsB, _ := Split([]byte("file B content, a bit longer"))
+	refsA, _, err := Split([]byte("file A content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refsB, _, err := Split([]byte("file B content, a bit longer"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	m := &Manifest{Files: []FileEntry{
 		{Path: "a.txt", Mode: 0o644, Chunks: refsA},
 		{Path: "dir/b.txt", Mode: 0o644, Chunks: refsB},

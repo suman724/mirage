@@ -45,11 +45,11 @@ server/            ACCEPTS the connection, drives the protocol, reconstructs fil
 test/              end-to-end integration test over real localhost gRPC
 ```
 
-> **Chunker note:** the current chunker is a placeholder fixed-size SHA-256
-> splitter behind the `chunk.Store` seam, not desync's content-defined chunking.
-> Swapping in [`folbricht/desync`](https://github.com/folbricht/desync) later is
-> a local change behind `GetChunk(hash) -> bytes`; transport and reconstruction
-> are unaffected.
+> **Chunker:** chunking and content hashing are backed by
+> [`folbricht/desync`](https://github.com/folbricht/desync) — `internal/chunk`
+> uses desync's content-defined chunker (16K/64K/256K) and desync chunk IDs
+> (SHA-512/256), all behind the `chunk.Store` seam (`GetChunk(hash) -> bytes`).
+> Identical content anywhere in the tree collapses to one chunk.
 
 ## Quickstart
 
@@ -74,6 +74,7 @@ diff -r testdata/workspace ./mirage-out   # only .env and id_rsa differ
 
 ## Requirements
 
-- Go 1.23 (`GOTOOLCHAIN=local`; deps are pinned to build on 1.23)
+- Go 1.25 (the `go` command auto-selects the matching toolchain; desync v1.0.1
+  and modern grpc require it)
 - For `make proto`: [`buf`](https://buf.build) plus `protoc-gen-go` and
   `protoc-gen-go-grpc` (`make tools`)

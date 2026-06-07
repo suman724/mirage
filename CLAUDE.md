@@ -38,10 +38,11 @@ make proto        # regen Go from proto/ (buf); `make tools` installs plugins
 make vet fmt tidy
 ```
 
-- **Go toolchain:** module is `go 1.23`; the Makefile sets `GOTOOLCHAIN=local`.
-  Dependencies are pinned to build on 1.23 (notably `grpc v1.72.2` — newer grpc
-  requires Go ≥1.25). If you bump grpc and the build demands a newer toolchain,
-  that's why; either pin back or consciously raise the module's Go version.
+- **Go toolchain:** module is `go 1.25` (raised from 1.23 on 2026-06-07 when we
+  adopted `folbricht/desync` v1.0.1 — desync's current release and modern grpc
+  both require Go ≥1.25). The Makefile uses `GOTOOLCHAIN=auto` so the `go`
+  command selects the matching toolchain (cached after first use). Pinning to
+  1.23 with 2023-era deps was considered and rejected as less production-worthy.
 - **buf/protoc are not assumed present in CI.** Generated code is committed
   (`proto/mirage/v1/*.pb.go`), so `go build`/`go test` work without buf. Only
   rerun `make proto` when you change the `.proto`.
@@ -51,7 +52,7 @@ make vet fmt tidy
 | Path | Role |
 |---|---|
 | `proto/mirage/v1/mirage.proto` | wire protocol; source of truth. Generated `*.pb.go` committed alongside. |
-| `internal/chunk` | `Hash`, `Manifest` (our stand-in for a desync `.caidx`), placeholder fixed-size SHA-256 `Split`, and the `Store` seam. |
+| `internal/chunk` | `Hash`, `Manifest`, desync-backed content-defined `Split` (`desync.NewChunker` + `desync.Digest` IDs), and the `Store` seam. |
 | `client/index` | walks a dir, applies ignore + secret exclusion, chunks files → `(Manifest, chunkstore)`. |
 | `client/chunkstore` | published chunks by hash; `Get` returns `found=false` for unpublished hashes. |
 | `client/transport` | **the only Dialer.** Hello → IndexPublish → answer ChunkRequests. |

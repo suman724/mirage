@@ -11,7 +11,7 @@ _Last updated: 2026-06-07._
 - ✅ Server + client on localhost reconstruct the multi-file test tree
   byte-for-byte using **only** chunks transferred over the stream.
 - ✅ Integration test passes (`go test ./...`).
-- ⬜ Commit it. _(awaiting go-ahead to commit)_
+- ✅ Commit it. _(commit `4dffa96`)_
 
 ## Core tasks (from the iteration brief)
 
@@ -43,9 +43,68 @@ _Last updated: 2026-06-07._
   `testdata/workspace` byte-for-byte via chunk requests; `.env` and `id_rsa`
   correctly excluded (never published, never reconstructed).
 
-## Next iterations (NOT started — do not begin yet)
+---
 
-- ⬜ Server-side FUSE mount so a real POSIX read faults chunks via `ChunkRequest`.
-- ⬜ Minimal non-interactive CLI to drive it.
+# Iteration 2 — Lazy FUSE read (recommended path)
+
+Goal of this iteration (design §9 Phase 2 / HANDOFF M2): a real POSIX `read()`
+on the server faults chunks over the channel via `ChunkRequest`, a local cache
+makes re-reads free, and reads are **lazy** — only touched files fault.
+
+**Why this order (desync → cache → FUSE → harness):** desync is the foundation
+that (a) gives real content-defined chunking + dedup, (b) provides the local
+cache **Store chaining** that FUSE needs, and (c) drives **concurrent**
+`GetChunk` calls — which our single gRPC stream already multiplexes via
+`request_id`. desync is fully validatable on macOS; FUSE has a platform
+dependency (macFUSE) we confront only after the foundation is solid.
+
+> **On concurrency / multiple connections:** desync provides concurrent chunk
+> *fetching* (worker-pool assembler) — we keep `channelstore` correct under
+> concurrent `GetChunk` via `request_id` correlation, and add a test for it.
+> Multiple *connections* / reconnect / multi-session is NOT desync's concern and
+> is NOT needed for this milestone — explicitly deferred.
+
+## Risks to validate EARLY (before building on them)
+
+| Risk | Validation step | Fallback |
+|---|---|---|
+| desync deps may require Go > 1.23 (we're pinned; grpc 1.72.2) | `go get` desync in a throwaway build, run `go build`; check toolchain | pin an older desync tag; or raise module Go consciously |
+| desync tree model: per-file `.caibx` vs catar+`.caidx` | small spike both ways; pick the simpler that preserves secret-exclusion at index time | keep our Manifest, embed desync per-file indexes |
+| macFUSE not installed / needs kext approval on this Mac | `make doctor` checks for macFUSE; try a no-op mount early | validate FUSE in a Linux container; keep reconstruct path as the macOS-testable proof |
+| Cold-read latency = 1 round-trip per missed chunk | measure round-trip in a benchmark; confirm cache hit path is local | prefetch (later phase) |
+
+## Tasks
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 2.1 | Validate desync compatibility / resolve toolchain | ✅ | desync v1.0.1 + modern grpc need Go ≥1.25; **module raised to Go 1.25** (user-approved). Validated: desync v1.0.1 + grpc v1.81.1 + protobuf v1.36.11 build/run on go1.25. |
+| 2.2 | Adopt desync behind the existing `chunk.Store` seam — real CDC + content hashing; keep secret-exclusion at index-build time | ✅ | `internal/chunk.Split` now uses `desync.NewChunker` (CDC, 16K/64K/256K) and `desync.Digest` chunk IDs. Transports/stores untouched. All tests + manual e2e green; dedup verified. |
+| 2.3 | Server local **cache** store (desync cache-store chaining: `cache → channelstore`); re-reads served locally | ⬜ | `server/cache` (new). Metric: cache hits vs channel fetches. |
+| 2.4 | Concurrency test: many concurrent `GetChunk` over one stream stay correct | ⬜ | Proves `request_id` multiplexing under desync's worker pool. |
+| 2.5 | FUSE mount (`hanwen/go-fuse`) on the server, backed by index → cache → channelstore; read faults chunks lazily | ⬜ | `server/fuse`. Gate 2.x: confirm mountability on this platform first. |
+| 2.6 | Harness stub: a process that `cat`s a file on the mount; assert correct bytes via faults, and a 2nd read hits cache | ⬜ | Non-interactive driver; the M2 "done when". |
+| 2.7 | Production hardening pass: structured logging (`log/slog`), context-aware errors, graceful shutdown, timeouts on every fetch | ⬜ | Non-negotiable across all of the above, not a final step. |
+| 2.8 | Keep README + CLAUDE.md + this file updated at each step | ⬜ | README gets a logical "how it works / how to use / who benefits" walkthrough. |
+
+**Done when:** a stub harness reads `workspace/foo` on the FUSE mount, gets the
+correct bytes via on-demand `ChunkRequest`s, and a second read is served from
+local cache with zero new channel traffic — all with production-grade logging
+and error handling, validated at every step.
+
+## Engineering standard (non-negotiable, applies to ALL tasks)
+
+- Structured logging (`log/slog`) with levels; no bare `log.Printf` in library code.
+- Every error wrapped with context (`%w` + package prefix); no swallowed errors.
+- Every network/fetch path is context-aware with a timeout; graceful shutdown.
+- Unit tests beside each package; integration test stays green at every commit.
+- `go build/vet/test ./...` and `gofmt -l .` clean before each step is "done".
+
+## Later iterations (NOT started)
+
+- ⬜ git fast-path (partial clone + working-tree delta).
+- ⬜ Write-back (sandbox → client) with base-hash conflict detection.
+- ⬜ Server-side search index (the search fault-storm mitigation).
+- ⬜ Prefetch + warm snapshots.
+- ⬜ TLS / auth / connection-bound tokens.
+- ⬜ Multiple/concurrent connections + reconnect/resume (transport hardening).
 - ⬜ TUI (last).
-- ⬜ Swap placeholder chunker for `folbricht/desync` behind the existing seam.

@@ -1,8 +1,10 @@
 # Mirage — lazy workspace filesystem + client-initiated transport.
 # See HANDOFF.md and docs/workspace-fs-and-transport.md.
 
-# Pin to the module's declared Go (1.23); deps are chosen to build on it.
-export GOTOOLCHAIN := local
+# Module targets Go 1.25 (desync v1.0.1 + modern grpc require it). `auto` lets
+# the go command select the matching toolchain (cached after first use).
+GOTOOLCHAIN ?= auto
+export GOTOOLCHAIN
 # Generated-code plugins (protoc-gen-go/-go-grpc) live in the Go bin dir.
 GOBIN := $(shell go env GOPATH)/bin
 export PATH := $(GOBIN):$(PATH)
