@@ -40,6 +40,13 @@ integration: ## run only the end-to-end integration test (verbose)
 test-race: ## run all tests under the race detector
 	go test -race ./...
 
+.PHONY: fuse-validate
+fuse-validate: ## build a Linux image and run the live FUSE mount test in it (needs Docker running)
+	docker build -t mirage-fuse-validate -f Dockerfile .
+	docker run --rm --cap-add SYS_ADMIN --device /dev/fuse \
+		--security-opt apparmor:unconfined mirage-fuse-validate \
+		go test -v -run TestLiveMount ./server/fuse/...
+
 .PHONY: vet
 vet: ## go vet
 	go vet ./...

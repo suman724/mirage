@@ -60,6 +60,7 @@ make vet fmt tidy
 | `client/transport` | **the only Dialer.** Hello → IndexPublish → answer ChunkRequests. |
 | `server/channelstore` | implements **`desync.Store`** over the stream: `GetChunk(id)` sends a `ChunkRequest`, awaits the matching `ChunkResponse` (correlated by `request_id`), returns a verified `desync.Chunk` (`NewChunkWithID`). No ctx in the signature (desync's interface) — the stream context + per-fetch timeout live inside the store. Safe for concurrent use. |
 | `server/transport` store chain | reuses desync: `desync.NewCache(desync.NewDedupQueue(channelstore), LocalStore)` — local disk cache → single-flight → channel. No bespoke cache (see `docs/desync-reuse-review.md`). |
+| `server/fuse` | thin tree FUSE presenting the manifest as a POSIX dir tree; file `Read` faults chunks lazily via `ReadRange` over the store chain. `ReadRange`/`IndexFromRefs` are pure + unit-tested; `Mount` needs a FUSE module at runtime. Live test (`TestLiveMount`) skips without FUSE; validate via `make fuse-validate` (Docker). |
 | `internal/logging` | `log/slog` setup (level + text/json), nil-safe `OrDefault` injection for libraries. |
 | `server/transport` | accepts the stream, sends `HelloAck`, on `IndexPublish` reconstructs the tree via the channelstore into `--out`. Reports a `Result` (files, bytes, chunk-request count). |
 | `test/` | end-to-end over real localhost gRPC; asserts byte-identical trees and that secrets were never reconstructed. |

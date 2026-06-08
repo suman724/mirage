@@ -42,6 +42,7 @@ client/            DIALS OUT, indexes a dir, serves chunks by hash
 server/            ACCEPTS the connection, drives the protocol, reconstructs files
   channelstore/      desync.Store whose GetChunk() = ChunkRequest over the stream
   transport/         accepts the stream; store chain = desync Cache->DedupQueue->channelstore
+  fuse/              thin tree FUSE: POSIX reads fault chunks lazily over the chain
 internal/logging/  structured log/slog setup shared by both binaries
 test/              end-to-end integration test over real localhost gRPC
 ```
