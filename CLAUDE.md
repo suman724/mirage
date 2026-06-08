@@ -62,7 +62,7 @@ make vet fmt tidy
 | `server/transport` store chain | reuses desync: `desync.NewCache(desync.NewDedupQueue(channelstore), LocalStore)` — local disk cache → single-flight → channel. No bespoke cache (see `docs/desync-reuse-review.md`). |
 | `server/fuse` | thin tree FUSE presenting the manifest as a POSIX dir tree; file `Read` faults chunks lazily via `ReadRange` over the store chain. `ReadRange`/`IndexFromRefs` are pure + unit-tested; `Mount` needs a FUSE module at runtime. Live test (`TestLiveMount`) skips without FUSE; validate via `make fuse-validate` (Docker). |
 | `internal/logging` | `log/slog` setup (level + text/json), nil-safe `OrDefault` injection for libraries. |
-| `server/transport` | accepts the stream, sends `HelloAck`, on `IndexPublish` reconstructs the tree via the channelstore into `--out`. Reports a `Result` (files, bytes, chunk-request count). |
+| `server/transport` | accepts the stream, sends `HelloAck`, and on `IndexPublish` *drives* one of two modes. **Reconstruct** (`New`, `--out`): write the tree to disk. **Mount** (`NewMounter`, `--mount`): FUSE-mount it so reads fault chunks lazily. The recv loop keeps dispatching `ChunkResponse`s while the driver runs; the driver owns cleanup (unmounts before the handler returns). Reports a `Result`. |
 | `test/` | end-to-end over real localhost gRPC; asserts byte-identical trees and that secrets were never reconstructed. |
 
 ## Protocol flow (current milestone)

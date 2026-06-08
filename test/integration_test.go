@@ -42,6 +42,17 @@ func uniqueChunkCount(t *testing.T, srcDir string) int {
 	return len(m.UniqueHashes())
 }
 
+// totalChunkRefs returns the total number of chunk references (with duplicates)
+// the client would publish for srcDir.
+func totalChunkRefs(t *testing.T, srcDir string) int {
+	t.Helper()
+	m, _, err := index.Build(srcDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return int(m.TotalChunks())
+}
+
 func TestEndToEndReconstruction(t *testing.T) {
 	srcDir := filepath.Join("..", "testdata", "workspace")
 	outDir := t.TempDir()
@@ -107,12 +118,12 @@ func TestEndToEndReconstruction(t *testing.T) {
 	assertTreesEqual(t, srcDir, outDir)
 }
 
-// assertTreesEqual checks that outDir contains exactly the publishable files of
-// srcDir (secrets/.git excluded) with byte-identical contents.
-func assertTreesEqual(t *testing.T, srcDir, outDir string) {
+// publishableFiles returns the files of srcDir that the client would publish
+// (secrets, .git and node_modules excluded), keyed by slash-relative path, with
+// their contents. It mirrors the client indexer's exclusion policy.
+func publishableFiles(t *testing.T, srcDir string) map[string][]byte {
 	t.Helper()
-
-	expected := map[string][]byte{}
+	files := map[string][]byte{}
 	err := filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -131,15 +142,24 @@ func assertTreesEqual(t *testing.T, srcDir, outDir string) {
 		if err != nil {
 			return err
 		}
-		expected[filepath.ToSlash(rel)] = b
+		files[filepath.ToSlash(rel)] = b
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(expected) == 0 {
-		t.Fatal("no expected files found; testdata missing?")
+	if len(files) == 0 {
+		t.Fatal("no publishable files found; testdata missing?")
 	}
+	return files
+}
+
+// assertTreesEqual checks that outDir contains exactly the publishable files of
+// srcDir (secrets/.git excluded) with byte-identical contents.
+func assertTreesEqual(t *testing.T, srcDir, outDir string) {
+	t.Helper()
+
+	expected := publishableFiles(t, srcDir)
 
 	// Every expected file must be reconstructed byte-for-byte.
 	for rel, want := range expected {

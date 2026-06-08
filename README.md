@@ -62,8 +62,16 @@ test/              end-to-end integration test over real localhost gRPC
 ```bash
 make build          # -> bin/mirage-server, bin/mirage-client
 make test           # unit + integration tests
+make test-race      # the whole suite under the race detector
 make proto          # regenerate Go from the .proto (needs buf; `make tools` once)
+make fuse-validate  # run the live FUSE mount tests in a Linux container (needs Docker)
 ```
+
+The server runs in one of two modes. **Reconstruct** (`--out`, the default)
+writes the published tree to disk. **Mount** (`--mount <dir>`) FUSE-mounts the
+workspace so a real POSIX read faults chunks lazily over the channel — the
+"reads like a local FS" path. FUSE needs a kernel module (macFUSE on macOS,
+`/dev/fuse` on Linux); `make fuse-validate` exercises it in a Linux container.
 
 Manual localhost demo (two terminals):
 

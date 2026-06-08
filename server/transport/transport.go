@@ -28,6 +28,7 @@ import (
 	"github.com/suman724/mirage/internal/logging"
 	miragev1 "github.com/suman724/mirage/proto/mirage/v1"
 	"github.com/suman724/mirage/server/channelstore"
+	miragefuse "github.com/suman724/mirage/server/fuse"
 )
 
 // Result summarizes one completed reconstruction. It is delivered to the
@@ -43,13 +44,22 @@ type Result struct {
 	Err           error
 }
 
-// Server implements miragev1.MirageServer. It reconstructs each published
-// index into OutDir.
+// MountInfo is reported once a connection's workspace has been FUSE-mounted.
+type MountInfo struct {
+	Mountpoint string        // directory the workspace is mounted at
+	Requests   func() uint64 // live count of chunks faulted over the wire so far
+}
+
+// Server implements miragev1.MirageServer. Per connection it either
+// reconstructs the published index into outDir (reconstruct mode) or FUSE-mounts
+// it at mountDir so reads fault chunks lazily (mount mode).
 type Server struct {
 	miragev1.UnimplementedMirageServer
 	outDir    string
+	mountDir  string
 	sandboxID string
 	onResult  func(Result)
+	onMounted func(MountInfo)
 	log       *slog.Logger
 }
 
@@ -61,6 +71,19 @@ func New(outDir string, onResult func(Result), logger *slog.Logger) *Server {
 		outDir:    outDir,
 		sandboxID: "mirage-sandbox-0",
 		onResult:  onResult,
+		log:       logging.OrDefault(logger),
+	}
+}
+
+// NewMounter returns a Server that FUSE-mounts each published workspace at
+// mountDir, so a real POSIX read faults chunks over the channel (the M2 goal).
+// onMounted may be nil; if set it is invoked once the mount is live. The mount
+// stays up until the client disconnects. logger may be nil.
+func NewMounter(mountDir string, onMounted func(MountInfo), logger *slog.Logger) *Server {
+	return &Server{
+		mountDir:  mountDir,
+		sandboxID: "mirage-sandbox-0",
+		onMounted: onMounted,
 		log:       logging.OrDefault(logger),
 	}
 }
@@ -106,7 +129,11 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 	}
 	storeChain := desync.NewCache(desync.NewDedupQueue(cs), localCache)
 
-	reconDone := make(chan Result, 1)
+	// The recv loop runs concurrently for the whole connection: it answers the
+	// Hello, forwards the published manifest to the driver, and (crucially)
+	// keeps dispatching ChunkResponses to the channelstore so faults are
+	// answered while a reconstruction or mount is in progress.
+	indexCh := make(chan *chunk.Manifest, 1)
 	recvErr := make(chan error, 1)
 
 	go func() {
@@ -135,19 +162,19 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 				ip := p.IndexPublish
 				manifest, err := chunk.Unmarshal(ip.GetCaidx())
 				if err != nil {
-					log.Error("failed to parse published index", "err", err)
-					reconDone <- Result{OutDir: s.outDir, Err: fmt.Errorf("parse index: %w", err)}
+					recvErr <- fmt.Errorf("parse index: %w", err)
 					return
 				}
-				log.Info("index published; starting reconstruction",
+				log.Info("index published",
+					"mode", s.mode(),
 					"files", len(manifest.Files),
 					"total_chunks", ip.GetTotalChunks(),
 					"unique_chunks", len(manifest.UniqueHashes()),
-					"total_bytes", ip.GetTotalBytes(),
-					"out_dir", s.outDir)
-				go func() {
-					reconDone <- s.reconstruct(ctx, manifest, storeChain)
-				}()
+					"total_bytes", ip.GetTotalBytes())
+				select {
+				case indexCh <- manifest:
+				default: // ignore a second IndexPublish on the same connection
+				}
 			case *miragev1.ClientFrame_ChunkResponse:
 				cs.Dispatch(p.ChunkResponse)
 			default:
@@ -157,21 +184,26 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 	}()
 
 	select {
-	case res := <-reconDone:
-		// Fill transport-level metrics: channel fetches (= distinct chunks
-		// faulted over the wire) vs cache hits (refs served from the local
-		// cache, i.e. duplicates). desync.Cache exposes no counters, so derive
-		// hits from total refs minus channel fetches.
+	case manifest := <-indexCh:
+		// Drive synchronously: the driver owns the full lifecycle (including, in
+		// mount mode, unmounting on disconnect) so the handler does not return —
+		// and the connection's resources are not reclaimed — until cleanup is
+		// done. The recv goroutine keeps dispatching ChunkResponses meanwhile.
+		res := s.drive(ctx, manifest, storeChain, cs)
+
+		// Channel fetches (= distinct chunks faulted over the wire) vs cache
+		// hits (refs served from the local cache). desync.Cache exposes no
+		// counters, so derive hits from total refs minus channel fetches.
 		res.ChunkRequests = cs.Requests()
 		if res.TotalRefs >= res.ChunkRequests {
 			res.CacheHits = res.TotalRefs - res.ChunkRequests
 		}
 		if res.Err != nil {
-			log.Error("reconstruction failed",
+			log.Error("session failed",
 				"err", res.Err, "files", res.Files,
 				"chunk_requests", res.ChunkRequests, "cache_hits", res.CacheHits)
 		} else {
-			log.Info("reconstruction complete",
+			log.Info("session complete",
 				"files", res.Files, "bytes", res.Bytes,
 				"chunk_requests", res.ChunkRequests, "cache_hits", res.CacheHits)
 		}
@@ -190,6 +222,50 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 		log.Warn("connection context done", "err", ctx.Err())
 		return ctx.Err()
 	}
+}
+
+// mode reports the per-connection driver mode for logging.
+func (s *Server) mode() string {
+	if s.mountDir != "" {
+		return "mount"
+	}
+	return "reconstruct"
+}
+
+// drive runs the per-connection work to completion: FUSE-mount the workspace
+// (mount mode) or reconstruct it into outDir (reconstruct mode). It returns
+// only after any cleanup (e.g. unmount) is done.
+func (s *Server) drive(ctx context.Context, m *chunk.Manifest, store desync.Store, cs *channelstore.Store) Result {
+	if s.mountDir != "" {
+		return s.serveMount(ctx, m, store, cs)
+	}
+	return s.reconstruct(ctx, m, store)
+}
+
+// serveMount FUSE-mounts the manifest at mountDir, backed by the store chain,
+// and serves lazy reads (each cold read faults chunks over the channel) until
+// the connection's context is cancelled, then unmounts. This is the M2 path: a
+// real POSIX read on the sandbox faults chunks via ChunkRequest.
+func (s *Server) serveMount(ctx context.Context, m *chunk.Manifest, store desync.Store, cs *channelstore.Store) Result {
+	res := Result{TotalRefs: uint64(m.TotalChunks())}
+	mount, err := miragefuse.New(s.mountDir, m, store, s.log)
+	if err != nil {
+		res.Err = fmt.Errorf("transport: mount workspace: %w", err)
+		return res
+	}
+	if s.onMounted != nil {
+		s.onMounted(MountInfo{Mountpoint: mount.Mountpoint(), Requests: cs.Requests})
+	}
+
+	// Stay mounted, faulting reads over the channel, until the client
+	// disconnects (stream context done).
+	<-ctx.Done()
+
+	if err := mount.Unmount(); err != nil {
+		s.log.Warn("unmount failed", "err", err)
+	}
+	res.Files = len(m.Files)
+	return res
 }
 
 // reconstruct materializes every file in the manifest into outDir, faulting

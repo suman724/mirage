@@ -43,14 +43,14 @@ func TestLiveMount(t *testing.T) {
 	store := storeFromManifest(t, m, cs)
 
 	mnt := t.TempDir()
-	server, err := Mount(mnt, m, store, nil)
+	mount, err := New(mnt, m, store, nil)
 	if err != nil {
 		t.Skipf("FUSE not available in this environment (expected on macOS without macFUSE): %v", err)
 	}
 	t.Cleanup(func() {
 		// Best-effort unmount; retry briefly in case the FS is still busy.
 		for i := 0; i < 10; i++ {
-			if err := server.Unmount(); err == nil {
+			if err := mount.Unmount(); err == nil {
 				return
 			}
 			time.Sleep(100 * time.Millisecond)

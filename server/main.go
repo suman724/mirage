@@ -1,7 +1,8 @@
 // Command mirage-server is the sandbox-side binary. It ACCEPTS the
 // client-initiated gRPC stream (never dials), then drives the protocol:
-// originate ChunkRequests over the open stream and reconstruct the published
-// workspace into --out, verifying each chunk by hash.
+// originate ChunkRequests over the open stream and either reconstruct the
+// published workspace into --out, or FUSE-mount it at --mount so reads fault
+// chunks lazily over the channel.
 package main
 
 import (
@@ -19,7 +20,8 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:7777", "listen address")
-	out := flag.String("out", "./mirage-out", "directory to reconstruct the workspace into")
+	out := flag.String("out", "./mirage-out", "directory to reconstruct the workspace into (reconstruct mode)")
+	mount := flag.String("mount", "", "directory to FUSE-mount the workspace at; if set, runs in mount mode instead of reconstruct")
 	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := flag.String("log-format", "text", "log format: text|json")
 	flag.Parse()
@@ -33,7 +35,14 @@ func main() {
 	}
 
 	gs := grpc.NewServer()
-	srv := transport.New(*out, nil, log)
+	var srv *transport.Server
+	if *mount != "" {
+		srv = transport.NewMounter(*mount, func(mi transport.MountInfo) {
+			log.Info("workspace mounted; reads will fault chunks over the channel", "mountpoint", mi.Mountpoint)
+		}, log)
+	} else {
+		srv = transport.New(*out, nil, log)
+	}
 	srv.Register(gs)
 
 	// Graceful shutdown on SIGINT/SIGTERM.
@@ -45,8 +54,12 @@ func main() {
 		gs.GracefulStop()
 	}()
 
+	mode, target := "reconstruct", *out
+	if *mount != "" {
+		mode, target = "mount", *mount
+	}
 	log.Info("mirage-server listening; waiting for client to dial in",
-		"addr", *addr, "out", *out)
+		"addr", *addr, "mode", mode, "target", target)
 	if err := gs.Serve(lis); err != nil {
 		log.Error("serve error", "err", err)
 		os.Exit(1)
