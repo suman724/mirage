@@ -351,12 +351,15 @@ Read one byte of a 100-chunk file and you fault exactly **one** chunk — that
 laziness is unit-tested (`ReadRange`). Read the same bytes again and the local
 cache (and the kernel's own page cache) serve them with no network at all.
 
-> **Status note.** The FUSE *code* is written and the read logic is unit-tested.
-> Actually *mounting* requires a FUSE kernel module, which isn't present on the
-> macOS dev machine (it needs macFUSE + a reboot). So the live mount test skips
-> locally and is set up to run in a Linux container (`make fuse-validate`),
-> which matches the real cloud-sandbox target. That validation is the one
-> remaining step for this part.
+> **Status note.** This is built *and validated live*. The server can run in
+> "mount mode" (`mirage-server --mount`): on receiving the index it FUSE-mounts
+> the workspace instead of reconstructing it, and reads fault chunks over the
+> channel. Mounting needs a FUSE kernel module, which isn't on the macOS dev
+> machine, so the live tests **skip** locally and run in a Linux container
+> (`make fuse-validate`) that matches the real cloud-sandbox target. There, the
+> full loop passes under the race detector: a real client + a mount-mode server
+> over gRPC, files read *through the kernel* (faulting chunks over the wire),
+> bytes verified, and a warm re-read served with no new network traffic.
 
 ---
 
@@ -367,16 +370,17 @@ cache (and the kernel's own page cache) serve them with no network at all.
 | Chunk hash, manifest, CDC split | `internal/chunk` (uses desync) |
 | Walk dir, exclude secrets, build manifest + store | `client/index`, `client/chunkstore` |
 | Dial out, publish, answer/reject chunk requests | `client/transport` |
-| Accept the connection, drive the protocol, reconstruct | `server/transport` |
+| Accept the connection, drive the protocol (reconstruct *or* mount) | `server/transport` |
 | The custom Store that fetches over the pipe | `server/channelstore` |
 | Cache + dedup + single-flight (reused from desync) | desync `Cache` + `DedupQueue` in `server/transport` |
 | Lazy POSIX reads via a mounted tree | `server/fuse` |
 | The wire protocol (single source of truth) | `proto/mirage/v1/mirage.proto` |
 | Structured logging | `internal/logging` |
-| End-to-end test over real gRPC | `test/` |
+| End-to-end tests over real gRPC (reconstruct + live FUSE) | `test/` |
 
 Two runnable binaries tie it together: `client/` (dials out, serves chunks) and
-`server/` (accepts, reconstructs). Both take `--log-level`/`--log-format`.
+`server/` (accepts, then either reconstructs into `--out` or FUSE-mounts at
+`--mount`). Both take `--log-level`/`--log-format`.
 
 ---
 
@@ -387,14 +391,19 @@ make build          # builds bin/mirage-server and bin/mirage-client
 make test           # unit + integration tests
 make test-race      # the same under the race detector
 
-# Two terminals, a real localhost run:
+# Two terminals, a real localhost run (reconstruct mode):
 make run-server     # accepts a connection, reconstructs into ./mirage-out
 make run-client     # dials out, publishes testdata/workspace
 diff -r testdata/workspace ./mirage-out   # only the excluded secrets differ
+
+# Live FUSE mount + full-loop harness, in a Linux container (needs Docker):
+make fuse-validate
 ```
 
 Add `--log-level debug` to the client to watch individual chunks being served,
-and to the server to watch cache hits vs. network faults.
+and to the server to watch cache hits vs. network faults. For the mount path,
+run the server with `--mount <dir>` (needs a FUSE module: macFUSE on macOS,
+`/dev/fuse` on Linux).
 
 ---
 
@@ -403,14 +412,14 @@ and to the server to watch cache hits vs. network faults.
 **Built and validated:** content-defined chunking (desync), the manifest, the
 outbound-only client-dials/server-asks connection, fingerprint-based fetch with
 verification, secret exclusion, the cache + dedup + single-flight store stack,
-and the FUSE read logic. End-to-end reconstruction is byte-for-byte correct, and
-the whole suite passes under the race detector.
+and the **FUSE lazy-read path** (server mount mode). Two things are proven
+end-to-end: reconstruction is byte-for-byte correct, and a **real POSIX read on
+the FUSE mount faults chunks over the channel** — validated live in a Linux
+container by a full client+server harness (read through the kernel → fault over
+the wire → warm re-read free). The whole suite passes under the race detector.
 
 **Next (not yet done):**
 
-- Run the **live FUSE mount** in a Linux container to validate real POSIX reads
-  end to end (`make fuse-validate`), plus a small "stub harness" that reads the
-  mount.
 - **git fast-path:** when the workspace is a git repo with a remote, the sandbox
   clones the bulk from the git host at cloud speed and the client only ships the
   *uncommitted* changes.
