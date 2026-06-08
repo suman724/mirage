@@ -9,7 +9,11 @@ stream* and the client serves them.
 That inversion — client opens the socket, server originates requests on it — is
 the core property Mirage proves.
 
-> **Start here:** [`HANDOFF.md`](./HANDOFF.md) for orientation, then
+> **New here?** Read [`docs/how-mirage-works.md`](./docs/how-mirage-works.md) — a
+> plain-language tour of the whole system (no desync/chunking/FUSE background
+> needed).
+>
+> **Start here for depth:** [`HANDOFF.md`](./HANDOFF.md) for orientation, then
 > [`docs/workspace-fs-and-transport.md`](./docs/workspace-fs-and-transport.md)
 > for the full design (esp. §2–§4, §6), and
 > [`proto/mirage/v1/mirage.proto`](./proto/mirage/v1/mirage.proto) for the wire
