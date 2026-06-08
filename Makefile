@@ -48,11 +48,18 @@ fuse-validate: ## build a Linux image and run the live FUSE mount tests in it (n
 		go test -v -run 'TestLiveMount|TestFuseHarness' ./server/fuse/... ./test/...
 
 .PHONY: fuse-demo
-fuse-demo: ## interactive FUSE demo in a Linux container: cat a file off the mount and watch chunks fault (needs Docker)
+fuse-demo: ## scripted FUSE demo in a Linux container: cat a file off the mount and watch chunks fault (needs Docker)
 	docker build -t mirage-fuse-validate -f Dockerfile .
 	docker run --rm --cap-add SYS_ADMIN --device /dev/fuse \
 		--security-opt apparmor:unconfined mirage-fuse-validate \
 		bash scripts/fuse-demo.sh
+
+.PHONY: fuse-shell
+fuse-shell: ## interactive shell in a Linux container with the workspace FUSE-mounted; ls/cat and watch faults (needs Docker)
+	docker build -t mirage-fuse-validate -f Dockerfile .
+	docker run --rm -it --cap-add SYS_ADMIN --device /dev/fuse \
+		--security-opt apparmor:unconfined mirage-fuse-validate \
+		bash scripts/fuse-shell.sh
 
 .PHONY: vet
 vet: ## go vet
