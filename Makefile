@@ -41,11 +41,18 @@ test-race: ## run all tests under the race detector
 	go test -race ./...
 
 .PHONY: fuse-validate
-fuse-validate: ## build a Linux image and run the live FUSE mount test in it (needs Docker running)
+fuse-validate: ## build a Linux image and run the live FUSE mount tests in it (needs Docker running)
 	docker build -t mirage-fuse-validate -f Dockerfile .
 	docker run --rm --cap-add SYS_ADMIN --device /dev/fuse \
 		--security-opt apparmor:unconfined mirage-fuse-validate \
-		go test -v -run TestLiveMount ./server/fuse/...
+		go test -v -run 'TestLiveMount|TestFuseHarness' ./server/fuse/... ./test/...
+
+.PHONY: fuse-demo
+fuse-demo: ## interactive FUSE demo in a Linux container: cat a file off the mount and watch chunks fault (needs Docker)
+	docker build -t mirage-fuse-validate -f Dockerfile .
+	docker run --rm --cap-add SYS_ADMIN --device /dev/fuse \
+		--security-opt apparmor:unconfined mirage-fuse-validate \
+		bash scripts/fuse-demo.sh
 
 .PHONY: vet
 vet: ## go vet
