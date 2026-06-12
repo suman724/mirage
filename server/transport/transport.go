@@ -16,7 +16,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -25,10 +24,12 @@ import (
 	"google.golang.org/grpc/peer"
 
 	"github.com/suman724/mirage/internal/chunk"
+	"github.com/suman724/mirage/internal/fsutil"
 	"github.com/suman724/mirage/internal/logging"
 	miragev1 "github.com/suman724/mirage/proto/mirage/v1"
 	"github.com/suman724/mirage/server/channelstore"
 	miragefuse "github.com/suman724/mirage/server/fuse"
+	"github.com/suman724/mirage/server/shim"
 )
 
 // Result summarizes one completed reconstruction. It is delivered to the
@@ -50,6 +51,16 @@ type MountInfo struct {
 	Requests   func() uint64 // live count of chunks faulted over the wire so far
 }
 
+// ShimInfo is reported once a connection's workspace skeleton is built and
+// the shim supervisor is accepting ENSURE requests (shim mode, design doc
+// docs/design-shimmer.md).
+type ShimInfo struct {
+	Root       string        // workspace root holding the skeleton (symlink-resolved)
+	SocketPath string        // supervisor unix socket (export as MIRAGE_SHIM_SOCK)
+	StateDir   string        // journal + chunk cache location for this session
+	Requests   func() uint64 // live count of chunks faulted over the wire so far
+}
+
 // Server implements miragev1.MirageServer. Per connection it either
 // reconstructs the published index into outDir (reconstruct mode) or FUSE-mounts
 // it at mountDir so reads fault chunks lazily (mount mode).
@@ -57,9 +68,12 @@ type Server struct {
 	miragev1.UnimplementedMirageServer
 	outDir    string
 	mountDir  string
+	shimDir   string
+	stateDir  string // shim mode: journal + cache + socket; empty = per-connection temp
 	sandboxID string
 	onResult  func(Result)
 	onMounted func(MountInfo)
+	onShim    func(ShimInfo)
 	log       *slog.Logger
 }
 
@@ -84,6 +98,23 @@ func NewMounter(mountDir string, onMounted func(MountInfo), logger *slog.Logger)
 		mountDir:  mountDir,
 		sandboxID: "mirage-sandbox-0",
 		onMounted: onMounted,
+		log:       logging.OrDefault(logger),
+	}
+}
+
+// NewShimmer returns a Server that projects each published workspace into
+// shimDir as a skeleton of sparse placeholders and serves lazy per-file
+// materialization over a unix socket (Shimmer: the FUSE-free mode for
+// platforms like Fargate, zero kernel privileges needed). stateDir holds the
+// state journal, the chunk cache, and the socket; if empty, a temp dir is
+// used and the session is not restart-recoverable. onShim may be nil; if set
+// it is invoked once the supervisor is accepting requests. logger may be nil.
+func NewShimmer(shimDir, stateDir string, onShim func(ShimInfo), logger *slog.Logger) *Server {
+	return &Server{
+		shimDir:   shimDir,
+		stateDir:  stateDir,
+		sandboxID: "mirage-sandbox-0",
+		onShim:    onShim,
 		log:       logging.OrDefault(logger),
 	}
 }
@@ -115,13 +146,17 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 	// local disk Cache, whose misses fall through a DedupQueue (single-flight)
 	// to the channelstore, which faults the chunk down the open stream.
 	//   cache(local) -> dedup -> channelstore -> ChunkRequest over the wire
+	//
+	// In shim mode the cache lives in the session state dir (alongside the
+	// journal) so a configured --shim-state survives restarts; other modes —
+	// and shim mode without a state dir — use a per-connection temp dir.
 	cs := channelstore.New(ctx, send, log)
-	cacheDir, err := os.MkdirTemp("", "mirage-cache-")
+	stateDir, cacheDir, cleanup, err := s.sessionDirs()
 	if err != nil {
-		log.Error("failed to create chunk cache dir", "err", err)
-		return fmt.Errorf("transport: create cache dir: %w", err)
+		log.Error("failed to prepare session dirs", "err", err)
+		return fmt.Errorf("transport: session dirs: %w", err)
 	}
-	defer os.RemoveAll(cacheDir)
+	defer cleanup()
 	localCache, err := desync.NewLocalStore(cacheDir, desync.StoreOptions{})
 	if err != nil {
 		log.Error("failed to open local chunk cache", "dir", cacheDir, "err", err)
@@ -189,7 +224,7 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 		// mount mode, unmounting on disconnect) so the handler does not return —
 		// and the connection's resources are not reclaimed — until cleanup is
 		// done. The recv goroutine keeps dispatching ChunkResponses meanwhile.
-		res := s.drive(ctx, manifest, storeChain, cs)
+		res := s.drive(ctx, manifest, storeChain, cs, stateDir)
 
 		// Channel fetches (= distinct chunks faulted over the wire) vs cache
 		// hits (refs served from the local cache). desync.Cache exposes no
@@ -226,20 +261,144 @@ func (s *Server) Connect(stream miragev1.Mirage_ConnectServer) error {
 
 // mode reports the per-connection driver mode for logging.
 func (s *Server) mode() string {
-	if s.mountDir != "" {
+	switch {
+	case s.mountDir != "":
 		return "mount"
+	case s.shimDir != "":
+		return "shim"
+	default:
+		return "reconstruct"
 	}
-	return "reconstruct"
+}
+
+// sessionDirs resolves where this connection's state journal (shim mode) and
+// chunk cache live, returning a cleanup for whatever is session-scoped. A
+// configured shim state dir persists (restart recovery); everything else is
+// a temp dir removed when the connection ends.
+func (s *Server) sessionDirs() (stateDir, cacheDir string, cleanup func(), err error) {
+	cleanup = func() {}
+	switch {
+	case s.shimDir != "" && s.stateDir != "":
+		stateDir = s.stateDir
+		// 0700: the state dir holds the supervisor socket and is its trust
+		// boundary (design §4).
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
+			return "", "", nil, fmt.Errorf("create state dir %q: %w", stateDir, err)
+		}
+	case s.shimDir != "":
+		tmp, err := os.MkdirTemp("", "mirage-shim-")
+		if err != nil {
+			return "", "", nil, fmt.Errorf("create temp state dir: %w", err)
+		}
+		stateDir = tmp
+		cleanup = func() { os.RemoveAll(tmp) }
+	default:
+		tmp, err := os.MkdirTemp("", "mirage-cache-")
+		if err != nil {
+			return "", "", nil, fmt.Errorf("create cache dir: %w", err)
+		}
+		cleanup = func() { os.RemoveAll(tmp) }
+		return "", tmp, cleanup, nil
+	}
+	cacheDir = filepath.Join(stateDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		cleanup()
+		return "", "", nil, fmt.Errorf("create cache dir %q: %w", cacheDir, err)
+	}
+	return stateDir, cacheDir, cleanup, nil
 }
 
 // drive runs the per-connection work to completion: FUSE-mount the workspace
-// (mount mode) or reconstruct it into outDir (reconstruct mode). It returns
-// only after any cleanup (e.g. unmount) is done.
-func (s *Server) drive(ctx context.Context, m *chunk.Manifest, store desync.Store, cs *channelstore.Store) Result {
-	if s.mountDir != "" {
+// (mount mode), project it as a lazy skeleton (shim mode), or reconstruct it
+// into outDir (reconstruct mode). It returns only after any cleanup
+// (e.g. unmount, supervisor shutdown) is done.
+func (s *Server) drive(ctx context.Context, m *chunk.Manifest, store desync.Store, cs *channelstore.Store, stateDir string) Result {
+	switch {
+	case s.mountDir != "":
 		return s.serveMount(ctx, m, store, cs)
+	case s.shimDir != "":
+		return s.serveShim(ctx, m, store, cs, stateDir)
+	default:
+		return s.reconstruct(ctx, m, store)
 	}
-	return s.reconstruct(ctx, m, store)
+}
+
+// serveShim builds the skeleton under shimDir and serves lazy per-file
+// materialization over the supervisor socket until the client disconnects
+// (Shimmer S1, docs/design-shimmer.md §3). Unlike mount mode there is nothing
+// to unmount: the workspace is a real directory; whatever was materialized or
+// locally written simply remains on disk.
+func (s *Server) serveShim(ctx context.Context, m *chunk.Manifest, store desync.Store, cs *channelstore.Store, stateDir string) Result {
+	res := Result{TotalRefs: uint64(m.TotalChunks())}
+
+	if err := os.MkdirAll(s.shimDir, 0o755); err != nil {
+		res.Err = fmt.Errorf("transport: create shim dir %q: %w", s.shimDir, err)
+		return res
+	}
+	table, err := shim.OpenTable(filepath.Join(stateDir, "journal.jsonl"), s.log)
+	if err != nil {
+		res.Err = fmt.Errorf("transport: open shim state: %w", err)
+		return res
+	}
+	defer func() {
+		if err := table.Close(); err != nil {
+			s.log.Warn("close shim state journal", "err", err)
+		}
+	}()
+
+	buildTime := time.Now()
+	skel, err := shim.BuildSkeleton(s.shimDir, m, table, buildTime, s.log)
+	if err != nil {
+		res.Err = fmt.Errorf("transport: build skeleton: %w", err)
+		return res
+	}
+
+	sup, err := shim.NewSupervisor(shim.Config{
+		Root:          s.shimDir,
+		SocketPath:    filepath.Join(stateDir, "shim.sock"),
+		Manifest:      m,
+		Store:         store,
+		Table:         table,
+		BuildTime:     buildTime,
+		ChunkRequests: cs.Requests,
+		Logger:        s.log,
+	})
+	if err != nil {
+		res.Err = fmt.Errorf("transport: start shim supervisor: %w", err)
+		return res
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- sup.Serve() }()
+
+	if s.onShim != nil {
+		s.onShim(ShimInfo{
+			Root:       sup.Root(),
+			SocketPath: sup.SocketPath(),
+			StateDir:   stateDir,
+			Requests:   cs.Requests,
+		})
+	}
+
+	// Serve ENSUREs until the client disconnects (stream context done) or the
+	// supervisor itself dies.
+	select {
+	case <-ctx.Done():
+		if err := sup.Close(); err != nil {
+			s.log.Warn("close shim supervisor", "err", err)
+		}
+		<-serveErr
+	case err := <-serveErr:
+		if cerr := sup.Close(); cerr != nil {
+			s.log.Warn("close shim supervisor", "err", cerr)
+		}
+		if err != nil {
+			res.Err = fmt.Errorf("transport: shim supervisor: %w", err)
+		}
+	}
+
+	res.Files = skel.Files
+	res.Bytes = skel.Bytes
+	return res
 }
 
 // serveMount FUSE-mounts the manifest at mountDir, backed by the store chain,
@@ -284,9 +443,9 @@ func (s *Server) reconstruct(ctx context.Context, m *chunk.Manifest, store desyn
 			res.Err = fmt.Errorf("transport: reconstruction cancelled: %w", err)
 			break
 		}
-		dst, err := safeJoin(s.outDir, f.Path)
+		dst, err := fsutil.SafeJoin(s.outDir, f.Path)
 		if err != nil {
-			res.Err = err
+			res.Err = fmt.Errorf("transport: %w", err)
 			break
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -343,14 +502,4 @@ func peerAddr(ctx context.Context) (string, bool) {
 		return p.Addr.String(), true
 	}
 	return "", false
-}
-
-// safeJoin joins a relative path onto root, rejecting traversal outside root.
-func safeJoin(root, rel string) (string, error) {
-	clean := filepath.Clean(filepath.Join(root, filepath.FromSlash(rel)))
-	rootAbs := filepath.Clean(root)
-	if clean != rootAbs && !strings.HasPrefix(clean, rootAbs+string(os.PathSeparator)) {
-		return "", fmt.Errorf("transport: path %q escapes output root", rel)
-	}
-	return clean, nil
 }
