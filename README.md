@@ -65,13 +65,23 @@ make test           # unit + integration tests
 make test-race      # the whole suite under the race detector
 make proto          # regenerate Go from the .proto (needs buf; `make tools` once)
 make fuse-validate  # run the live FUSE mount tests in a Linux container (needs Docker)
+make shim-validate  # Shimmer: the FUSE-free lazy mode + C shim, in an UNPRIVILEGED container (needs Docker)
 ```
 
-The server runs in one of two modes. **Reconstruct** (`--out`, the default)
+The server runs in one of three modes. **Reconstruct** (`--out`, the default)
 writes the published tree to disk. **Mount** (`--mount <dir>`) FUSE-mounts the
 workspace so a real POSIX read faults chunks lazily over the channel — the
 "reads like a local FS" path. FUSE needs a kernel module (macFUSE on macOS,
 `/dev/fuse` on Linux); `make fuse-validate` exercises it in a Linux container.
+**Shim** (`--shim <dir>`, optionally `--shim-state <dir>` for a
+restart-recoverable journal+cache) projects the workspace as a real directory
+of sparse placeholders and materializes each file on first open, driven by an
+`LD_PRELOAD` shim talking to a supervisor socket — the lazy workspace for
+platforms that forbid FUSE entirely (e.g. AWS Fargate: no privileges, no
+devices needed). See [`docs/design-shimmer.md`](./docs/design-shimmer.md);
+`make shim-validate` runs the whole loop plus a libc tool matrix (`cat`,
+`grep -r`, `python3`, `node`, `sed -i`, globs, `find`) in a container with no
+added capabilities.
 
 Manual localhost demo (two terminals):
 

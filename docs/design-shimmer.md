@@ -1,6 +1,10 @@
 # Shimmer — FUSE-free workspace projection (design)
 
-**Status:** draft, for review
+**Status:** S1 (skeleton + supervisor) and S2 (C shim + Docker validation)
+are **implemented and validated** (`server/shim`, `shim/mirageshim.c`,
+`make shim-validate`); §10 milestones S3–S6 remain. The S2 decision in §4.1
+(open()-only + pristine check) is in effect; STATS was added as a fourth
+supervisor verb and `--shim-state` makes the journal persistent.
 **Scope:** server-side only. The wire protocol gains one field (mtime); the
 client gains one opt-in flag (.git indexing). Everything else is additive.
 **Background:** `docs/mirage-on-fargate.md` (plain-language analysis of why
