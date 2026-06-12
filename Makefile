@@ -61,6 +61,11 @@ fuse-shell: ## interactive shell in a Linux container with the workspace FUSE-mo
 		--security-opt apparmor:unconfined mirage-fuse-validate \
 		bash scripts/fuse-shell.sh
 
+.PHONY: shim-validate
+shim-validate: ## build a Linux image and run the Shimmer validation (C shim + libc tool matrix) — runs UNPRIVILEGED, no FUSE (needs Docker)
+	docker build -t mirage-validate -f Dockerfile .
+	docker run --rm mirage-validate bash scripts/shim-validate.sh
+
 .PHONY: vet
 vet: ## go vet
 	go vet ./...
