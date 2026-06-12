@@ -142,6 +142,46 @@ setup. The supervisor holds the listener and services everyone.
                  └── python           ← …and here. all trapped, no setup.
 ```
 
+### The components, wired together
+
+```mermaid
+flowchart TB
+  subgraph LAPTOP["Laptop (client) — behind NAT"]
+    FILES["Real project files"]
+    PUB["Published chunks<br/>(hash → bytes)"]
+  end
+
+  subgraph CLOUD["Cloud sandbox — unprivileged; mirage-server runs as PID 1"]
+    subgraph SUP["Supervisor = mirage-server (Go), NOT filtered"]
+      LOOP["seccomp notification loop"]
+      MAT["Materializer<br/>(fill placeholder + pristine check)"]
+      STORE["Store stack:<br/>Cache → DedupQueue → channelstore"]
+      MAN["Manifest"]
+    end
+    LAUNCH["Launcher (C)<br/>install filter, hand off listener fd"]
+    subgraph WL["Workload subtree — seccomp filter inherited by all"]
+      TOOLS["agent · grep · python · static Go binary"]
+    end
+    WS["/workspace skeleton<br/>real dirs + sparse placeholders"]
+    KERNEL{{"Linux kernel<br/>seccomp filter + listener fd"}}
+  end
+
+  FILES --> PUB
+  STORE <-->|"one outbound gRPC pipe<br/>(client dials, server asks)"| PUB
+  SUP -->|"spawns (so it is an ancestor)"| LAUNCH
+  LAUNCH -->|"execve"| TOOLS
+  LAUNCH -.->|"listener fd via SCM_RIGHTS"| LOOP
+  TOOLS -->|"open() syscall"| KERNEL
+  KERNEL -->|"pause + notify"| LOOP
+  LOOP -->|"read path from /proc/[pid]/mem"| TOOLS
+  LOOP --> MAT
+  MAT -->|"fetch chunks"| STORE
+  MAT -->|"write real bytes"| WS
+  LOOP -->|"respond CONTINUE"| KERNEL
+  KERNEL -->|"resume; open hits real file"| TOOLS
+  TOOLS -->|"read()"| WS
+```
+
 ### One important rule: the supervisor must be an *ancestor*
 
 To know *which file* a paused program is opening, the supervisor has to read the
@@ -180,6 +220,32 @@ Say the agent runs `cat /workspace/src/main.go`. Step by step:
 5. **Resume.** The supervisor tells the kernel "proceed." `cat`'s `open`
    completes against the now-real file, and `cat` reads correct content. It never
    knew it was paused.
+
+As a sequence:
+
+```mermaid
+sequenceDiagram
+    participant T as Tool (grep/python/Go)
+    participant K as Kernel (seccomp)
+    participant S as Supervisor
+    participant ST as Store stack
+    participant C as Laptop (client)
+
+    T->>K: open("/workspace/src/main.go")
+    K-->>S: notify — process paused
+    S->>T: read path from /proc/[pid]/mem (ID_VALID-bracketed)
+    Note over S: inside /workspace? → materialize
+    loop each chunk of the file
+        S->>ST: GetChunk(hash)
+        ST->>C: ChunkRequest (only on cache miss)
+        C-->>ST: ChunkResponse (bytes)
+        ST-->>S: chunk bytes
+    end
+    S->>S: write bytes into the placeholder
+    S-->>K: respond CONTINUE
+    K-->>T: open() resumes on the now-real file
+    T->>T: read() — correct content
+```
 
 `ls`/`find` cost almost nothing (step 3 says "no content needed" for
 directories). `grep -r /workspace` is the heavy case: it opens *every* file, so
