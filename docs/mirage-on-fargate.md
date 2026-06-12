@@ -394,9 +394,12 @@ Three design decisions before building:
    `.git`, whose index mtimes match those same files) makes status a
    metadata-only walk. Without it, the lazy win quietly evaporates on the
    most common git command.
-3. **Writes stay local** in the overlay (consistent with write-back being
-   out of scope). Caveat: the indexer skips symlinks, so repos containing
-   them show phantom deletions in status.
+3. **Writes stay local** in the overlay for now. Write-back to the laptop
+   is an *eventual* Mirage goal (planned phase M4 in the original design),
+   deferred until the basics are proven — and the overlay's record of
+   locally-changed paths is exactly what a future write-back would ship.
+   Caveat: the indexer skips symlinks, so repos containing them show
+   phantom deletions in status.
 
 Effort: the billy surface is larger than `fs.FS` (OpenFile, Rename, Remove,
 Lstat, TempFile, Chroot…), so adapter + overlay is roughly 600–900 LOC, plus

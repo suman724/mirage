@@ -43,7 +43,11 @@ Goals:
 
 Non-goals:
 
-- Write-back to the laptop (writes stay server-local; unchanged from today).
+- Write-back to the laptop **in this workstream**. Write-back remains an
+  eventual Mirage goal (original design M4 / Phase 4), deliberately deferred
+  until the basics are proven. Shimmer keeps the door open rather than
+  closing it: the `local` state in the table (§3.2) is exactly the set of
+  paths a future write-back would ship, so nothing here needs undoing.
 - Intercepting third-party Go/static binaries (see seccomp spike, §11).
 - Replacing the FUSE mode. `--mount` remains the preferred mode where FUSE
   exists; Shimmer is the constrained-platform alternative.
