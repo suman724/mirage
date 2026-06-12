@@ -114,6 +114,13 @@ placeholders as materialized. Per-path singleflight so concurrent ENSUREs
 of one file fetch once (chunk-level dedup already exists in the store
 chain; this is file-level).
 
+**Important limit (see §4.1):** with only `open()` intercepted, the `local`
+set is a *lower bound* on what actually diverged from the manifest — tree
+mutations that don't pass through `open()` (rename, unlink, mkdir, chmod…)
+are invisible to it. The state table is therefore not a complete change
+ledger until either the namespace syscalls are also intercepted or a
+sync-time rescan reconciles it.
+
 ## 4. The shim (`libmirageshim.so`)
 
 **Language: C** (~400 LOC target). Not Go: a `c-shared` Go runtime injected
@@ -140,16 +147,70 @@ on OK  → real open (content now real)
 on ERR → return -1, errno=EIO (loud)
 ```
 
-Writes need no special casing beyond ENSURE-before-open: once content is
-real, `O_WRONLY/O_RDWR/O_APPEND/mmap/sendfile` all operate on a real file.
-Opens for write additionally send `DIRTY <path>` (fire-and-forget) so the
-supervisor flips the state to `local` — the billy adapter (§7) must know
-the manifest no longer describes this file.
+Modifying the bytes of an existing file needs no special casing beyond
+ENSURE-before-open: once content is real, `O_WRONLY/O_RDWR/O_APPEND/mmap/
+sendfile` all operate on a real file. Opens for write additionally send
+`DIRTY <path>` (fire-and-forget) so the supervisor flips the state to
+`local` — the billy adapter (§7) must know the manifest no longer describes
+this file. **But "writing" is more than in-place byte changes; see §4.1 for
+what `open()`-only interception does *not* catch and why it matters even
+before write-back.**
 
 Protocol: newline-delimited text over `SOCK_STREAM` unix socket, one
 request per connection, 30s timeout. Deliberately primitive — the C side
 stays trivial, and the socket is same-container with filesystem
 permissions (0700 dir) as the trust boundary.
+
+### 4.1 Writes: what `open()` covers, and what it doesn't
+
+`open()` is the choke point for file **content**: once a process holds an fd
+to a real file, all of `write/pwrite/writev/ftruncate(fd)/mmap(MAP_SHARED)/
+fsync/close` go to the kernel against that real inode with no further
+interception. So for *changing the bytes of a file that already exists in
+the manifest*, intercepting `open()` is a complete and correct foundation.
+
+What `open()` does **not** see are the syscalls that mutate the *tree shape*
+rather than a file's contents: `rename`, `unlink`, `rmdir`, `mkdir`,
+`link`, `symlink`, `chmod`/`chown`, `utimensat`, and path-form
+`truncate(path)`. None take a workspace fd via our intercepted open, so the
+state table never learns about them.
+
+This is not only a future-write-back concern — it has a **read-correctness
+bug today** via the most common safe-save pattern (editors, many libraries):
+
+```
+open("f.tmp", O_CREAT|O_WRONLY)   → new path, shim passes through, bytes land
+write(...) ; close(...)
+rename("f.tmp", "f")              → INVISIBLE to an open-only shim
+```
+
+After the rename, the inode at `f` is the tmp's real, user-written content,
+but the supervisor still has `f` = `placeholder`. The next reader's open
+triggers ENSURE, the supervisor sees `placeholder`, and **materializes
+manifest content over the user's saved edit — silent data loss, within a
+single session.**
+
+Two safeguards, composable; the first is cheap and lands with the shim, the
+second is the proper fix tracked for the write workstream:
+
+1. **Pristine-placeholder check before materializing.** ENSURE must confirm
+   the on-disk file is still an untouched placeholder (still sparse / a
+   recorded inode+ctime marker) before overwriting it. If it isn't, the
+   file was replaced out from under us → treat as `local`, never clobber.
+   This closes the data-loss case without any new interception.
+2. **Intercept the namespace syscalls** (listed above) so the state table
+   stays live and accurate. This is the foundation a write-back ledger
+   needs: the slice it ships is then exactly the `local` set. Alternatively
+   (or additionally) a **sync-time rescan** — walk the overlay, diff against
+   the manifest by size/mtime/hash — reconciles the table without any
+   namespace hooks, at the cost of rehashing; the state table makes that
+   diff cheap by marking which files are even candidates.
+
+**Decision:** S2 ships `open()`-only plus safeguard (1). The namespace
+syscalls are explicitly reserved, not built now (tracked as a Shimmer
+issue), so the shim stays small and we don't speculatively build write-back
+machinery before the basics are proven — while keeping the foundation sound
+(no silent clobber) in the meantime.
 
 Known escape hatches (accepted, documented): `env -i` / setuid strip
 `LD_PRELOAD`; a libc tool could in principle issue raw `syscall(SYS_open)`.
@@ -265,8 +326,9 @@ Extend the Docker harness (pattern: `make fuse-validate`) with
 ## 10. Milestones
 
 1. **S1 — skeleton + supervisor**: `--shim` mode, skeleton builder, state
-   table, ENSURE materializer, unit tests. (No shim yet — exercised via a
-   test client on the socket.)
+   table, ENSURE materializer **with the pristine-placeholder check (§4.1
+   safeguard 1)**, unit tests. (No shim yet — exercised via a test client on
+   the socket.)
 2. **S2 — shim**: C library, open family + ENSURE, Docker validation of
    the libc tool matrix.
 3. **S3 — exec gate**: classification + 3 policies, env re-injection.
@@ -274,6 +336,10 @@ Extend the Docker harness (pattern: `make fuse-validate`) with
    with scrub.
 5. **S5 — billy adapter**: `server/billyfs`, go-git demo + laziness tests.
 6. **S6 — Fargate validation**: harness as a Fargate task; document.
+
+Reserved (not scheduled; foundation for write-back, tracked as its own
+issue): **namespace-syscall interception** (rename/unlink/mkdir/chmod…) per
+§4.1 safeguard 2, to turn the `local` set into a complete change ledger.
 
 S1–S2 deliver standalone value (lazy libc tools); S4–S5 deliver git.
 
