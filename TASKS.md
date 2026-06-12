@@ -112,12 +112,13 @@ Tracked as GitHub issues **#1–#10** (tracking issue #10); design in
 | # | Milestone | Status | Notes |
 |---|-----------|--------|-------|
 | S1 | Skeleton + supervisor (`--shim`, state table + journal, ENSURE materializer with the pristine-placeholder check, `--shim-state` persistence) | ✅ | `server/shim` + `internal/fsutil`; unit tests incl. rename-over no-clobber, torn-fill crash recovery, restart replay; e2e `test/shim_test.go` runs everywhere (no FUSE). STATS added as a 4th supervisor verb. |
-| S2 | C `LD_PRELOAD` shim (open+fopen families) + Docker tool-matrix validation | ✅ | `shim/mirageshim.c` + `make shim-validate` — runs UNPRIVILEGED (no caps/devices: the Fargate property). cat / grep -r / python3 / node / sed -i / glob / find all byte-identical; laziness, DIRTY→local, and MATERIALIZE_ALL no-clobber asserted. Finding: sed -i's rename-over never sends DIRTY (glibc-internal mkstemp bypasses the PLT), confirming `local` is a lower bound — write-back needs #21 or a sync-time rescan. |
-| #8 | seccomp-unotify spike — **run before S3**; a positive result retires the exec gate | ⬜ | Local half provable in unprivileged Docker; Fargate half needs a one-shot task. |
-| S3 | Exec gate (ELF classification, deny/materialize/allow policies) | ⬜ | Shape depends on the #8 outcome. |
-| S4 | Manifest mtime + `--include-git` (config scrub, hooks excluded) | ⬜ | Independent of #8; prerequisite for lazy git status. |
+| S2 | C `LD_PRELOAD` shim (open+fopen families) + Docker tool-matrix validation | ✅ | `shim/mirageshim.c` + `make shim-validate` — runs UNPRIVILEGED. All libc tools byte-identical; laziness, DIRTY→local, MATERIALIZE_ALL no-clobber asserted. **Demoted to fallback by the §3.3 seccomp pivot.** Finding: sed -i's rename-over never sends DIRTY (glibc-internal mkstemp), confirming `local` is a lower bound. |
+| #8 | seccomp-unotify viability spike | ✅ | **PASSED on real ECS Fargate** (x86_64, kernel 6.1.170, ptrace_scope=1): install + notify + cross-process mem-read + respond, all unprivileged. `spike/seccomp_unotify_probe.py`. → seccomp is the primary interception mechanism (design §3.3). |
+| S3 | ~~Exec gate~~ | ❌ RETIRED | Superseded by §3.3 — seccomp intercepts Go/static natively, nothing to gate. |
+| S3′ | **Seccomp supervisor (primary path)**: C launcher + Go notification loop (RECV/ID_VALID/ADDFD/SEND), path resolution from registers, reuse `Ensure()`, supervisor as PID 1 | ⬜ | Re-validate on Fargate with a libc tool AND a static Go binary; measure per-trap latency. Delete the C shim once green. Open: perf (every open traps), ADDFD fidelity, arm64, daemon reparenting. |
+| S4 | Manifest mtime + `--include-git` (config scrub, hooks excluded) | ⬜ | Independent of the interception mechanism; prerequisite for lazy git status. |
 | S5 | Billy adapter (`server/billyfs`) for in-process go-git | ⬜ | |
-| S6 | Fargate validation (harness image as a one-shot task) | ⬜ | Cheap pull-forward once any Fargate task is deployed for #8. |
+| S6 | Fargate validation (full harness as a one-shot task) | ⬜ | |
 
 ## Later iterations (NOT started — filed as [Horizon] issues #11–#20, tracking #20)
 

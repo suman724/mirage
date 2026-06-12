@@ -2,9 +2,21 @@
 
 **Status:** S1 (skeleton + supervisor) and S2 (C shim + Docker validation)
 are **implemented and validated** (`server/shim`, `shim/mirageshim.c`,
-`make shim-validate`); §10 milestones S3–S6 remain. The S2 decision in §4.1
-(open()-only + pristine check) is in effect; STATS was added as a fourth
-supervisor verb and `--shim-state` makes the journal persistent.
+`make shim-validate`). The S2 decision in §4.1 (open()-only + pristine check)
+is in effect; STATS was added as a fourth supervisor verb and `--shim-state`
+makes the journal persistent.
+
+**PIVOT (2026-06-12): the interception layer is moving from the LD_PRELOAD C
+shim to seccomp user-notification.** The viability spike (`spike/`,
+issue #8) **passed on a real ECS Fargate task** (x86_64, kernel 6.1.170,
+ptrace_scope=1): an unprivileged process can install a notification filter,
+trap a syscall, read the target's memory for the path, and respond. This
+makes seccomp — which covers Go/static binaries that the C shim structurally
+cannot — the **primary** interception front-end. See the new **§3.3**. The C
+shim (§4) and exec gate (§5) are **superseded** by §3.3 (shim demoted to
+fallback; exec gate not being built). The supervisor/state-table/materializer
+/store-chain core (§3.1–3.2) is **reused unchanged** under either front-end.
+
 **Scope:** server-side only. The wire protocol gains one field (mtime); the
 client gains one opt-in flag (.git indexing). Everything else is additive.
 **Background:** `docs/mirage-on-fargate.md` (plain-language analysis of why
@@ -52,7 +64,11 @@ Non-goals:
   until the basics are proven. Shimmer keeps the door open rather than
   closing it: the `local` state in the table (§3.2) is exactly the set of
   paths a future write-back would ship, so nothing here needs undoing.
-- Intercepting third-party Go/static binaries (see seccomp spike, §11).
+- ~~Intercepting third-party Go/static binaries~~ — **now in scope** via the
+  seccomp pivot (§3.3): syscall-level interception is binary-agnostic, so the
+  Go/static carve-out and the original "fail loud on a Go binary" stance (the
+  exec gate, §5) are retired. G1/G3 still hold; G3 strengthens (no class of
+  binary can read placeholder zeros).
 - Replacing the FUSE mode. `--mount` remains the preferred mode where FUSE
   exists; Shimmer is the constrained-platform alternative.
 
@@ -125,7 +141,130 @@ are invisible to it. The state table is therefore not a complete change
 ledger until either the namespace syscalls are also intercepted or a
 sync-time rescan reconciles it.
 
+## 3.3 Interception via seccomp user-notification (PRIMARY, validated on Fargate)
+
+**This section supersedes §4 (C shim) and §5 (exec gate) as the chosen
+interception mechanism.** Both are retained below: §4 as a documented fallback
+for environments that forbid seccomp, §5 as superseded (not being built).
+
+### Core vs. front-end
+
+Everything in §3.1–3.2 — skeleton, state table, journal, pristine check,
+materializer, store chain — is the **mechanism-agnostic core**. It answers one
+question, "make this path real," and does not care how the request arrives.
+S1 built that core; S2 attached one *front-end* to it (the LD_PRELOAD shim,
+talking ENSURE/DIRTY over a unix socket). The pivot swaps the front-end:
+
+| Front-end | Covers | Status |
+|---|---|---|
+| LD_PRELOAD C shim (§4) | libc-dynamic tools only; **blind to Go/static, glibc-internal opens, raw syscalls** | validated (S2); demoted to fallback |
+| seccomp user-notification (this section) | **every** binary in the subtree — libc, Go, static — at the syscall layer | primary; mechanism proven on Fargate (#8) |
+
+Why the pivot: the C shim's blind spots (a Go `gopls`, a static `ripgrep`, sed's
+glibc-internal `mkstemp`) read placeholder zeros *silently*. seccomp intercepts
+at the syscall boundary, which **nothing in userspace can bypass**, so the
+Go/static carve-out (§1) and the exec gate built to contain it (§5) both
+disappear. The cost is higher baseline overhead (see "Performance" below).
+
+### Topology — and why it's load-bearing
+
+Reading the path a tool passed to `open()` means reading a pointer into *that
+tool's* address space (`/proc/<pid>/mem`). Under the observed Fargate setting
+`kernel.yama.ptrace_scope=1`, a process may read another's memory **only if it
+is an ancestor** of it. Therefore the supervisor must sit above the entire
+workload in the process tree:
+
+```
+supervisor  (Go) — runs as PID 1 / the task entrypoint        ← NOT filtered
+  • builds skeleton; owns state table + journal + materializer  [REUSED, §3.1–3.2]
+  • owns the chunk store chain                                  [REUSED, G5]
+  • fork+exec the launcher; receives + holds the listener fd
+  • notification loop (below)
+  └── launcher (C, ~80 LOC):
+        prctl(NO_NEW_PRIVS); fd = seccomp(…, NEW_LISTENER);
+        send(fd → supervisor); execve(workload)
+        └── workload subtree — filter inherited across fork+execve, NO LD_PRELOAD:
+              bash → ls · grep -R · python · node · go-built tools · static bins
+```
+
+The seccomp filter propagates *downward* (inherited by every `fork`/`execve`
+descendant) and never to the parent, so the workload subtree is filtered while
+the supervisor is not. Running the supervisor as **PID 1** is deliberate: a tool
+that daemonizes (double-forks to reparent onto init) would otherwise escape the
+supervisor's subtree and become unreadable under scope=1 — but if the supervisor
+*is* init, every process in the task remains its descendant by construction.
+
+### The notification loop (per intercepted `open`)
+
+1. A tool calls `openat`; the kernel **pauses** it and queues a notification.
+2. Supervisor `NOTIF_RECV`s it: target pid, syscall nr, and the arg registers
+   (arg1 = the pathname pointer).
+3. Resolve the path: read the string from `/proc/<pid>/mem`; for `*at` calls
+   resolve a relative path against the `dirfd` via `/proc/<pid>/fd/<dirfd>`
+   (and `AT_FDCWD` via `/proc/<pid>/cwd`). Bracket every memory read with
+   `NOTIF_ID_VALID` (the man-page TOCTOU rule) so a signal-interrupted target
+   can't feed us stale bytes.
+4. Decide: outside the workspace → fast-path (allow, no work). Inside →
+   `Ensure(rel)` — **the exact S1 materializer**, with the same pristine check.
+5. Respond. Preferred: **ADDFD** — the supervisor opens the now-real file with
+   the tool's original flags and injects that fd as the syscall's return value.
+   No re-execution, so no TOCTOU window. (`CONTINUE`, which re-runs the real
+   syscall, is the simpler fallback but carries the documented arg-rewrite race.)
+6. The tool resumes with a correct fd onto real content.
+
+`ls`/`find` cost almost nothing: their opens are directories (real in the
+skeleton) → fast-path. `grep -R` is the worst case: it opens every file →
+every file materializes (whole-file), the same per-file laziness ceiling as the
+C shim and `--out`. The real fix for content-scanning storms stays the
+published search index (Horizon).
+
+### What changes vs. S1/S2
+
+- **New:** the C launcher; the supervisor's notification loop (hand-rolled
+  notif structs + `RECV`/`ID_VALID`/`ADDFD`/`SEND` ioctls — `x/sys/unix`
+  exports the flags but not these struct/ioctl definitions); path resolution
+  from registers.
+- **Reused unchanged:** skeleton, state table, journal, pristine check,
+  `Ensure()`/materializer, store chain.
+- **Retired:** the `LD_PRELOAD` env injection and the unix-socket ENSURE/DIRTY
+  protocol (the kernel notification replaces them); the exec gate (§5); and,
+  once seccomp is validated end-to-end on Fargate with a real Go/static binary,
+  the C shim itself (`mirageshim.c`, `make shim-validate`).
+- **Made cheap:** the namespace-syscall ledger (rename/unlink/… , §4.1
+  safeguard 2, reserved issue #21) becomes "add syscall numbers to the filter"
+  rather than a second interception system — accelerating write-back (#16).
+
+### Performance — the remaining real unknown
+
+A BPF filter **cannot match on a path** (the arg is a pointer, not a value), so
+*every* `openat` from *every* process in the subtree traps — including the
+hundreds of `/usr/lib` opens a normal program makes — and each one **blocks**
+until the supervisor responds. The C shim only round-tripped for workspace
+files; seccomp round-trips for all opens. Implications the spike did **not**
+measure and the next slice must:
+
+- The supervisor's non-workspace fast-path must be ruthlessly cheap (tens of µs
+  budget per trap).
+- Servicing needs concurrency (a worker pool draining the listener) so one slow
+  network chunk-fault doesn't serialize every other process's opens.
+- Real-workload latency (`go build`, `npm install`) is unquantified — measure
+  before committing.
+
+### DIRTY / write tracking under seccomp
+
+The C shim sent a separate DIRTY message on write-intent opens. Under seccomp
+the supervisor sees the open flags directly in the notification, so write-intent
+→ `local` is recorded inline with no second message — and reliably, closing the
+S2 gap where sed's glibc-internal open never sent DIRTY.
+
 ## 4. The shim (`libmirageshim.so`)
+
+> **SUPERSEDED (2026-06-12) by §3.3 on platforms where seccomp is available
+> (incl. Fargate).** This front-end is validated (S2) and retained as a
+> fallback for environments that forbid seccomp filter installs; it is *not*
+> the primary path and will be removed once §3.3 is validated end-to-end.
+> Its structural blind spots (Go/static, glibc-internal opens, raw syscalls)
+> are exactly why the pivot happened.
 
 **Language: C** (~400 LOC target). Not Go: a `c-shared` Go runtime injected
 into every process is fork-unsafe and heavyweight; the shim must be safe in
@@ -224,6 +363,13 @@ spike (§11).
 
 ## 5. Exec gate
 
+> **SUPERSEDED — NOT BEING BUILT (2026-06-12).** The exec gate existed solely to
+> contain the C shim's Go/static blind spot by classifying binaries and
+> blocking or fully-materializing for the uninterceptable ones. The seccomp
+> pivot (§3.3) intercepts Go/static binaries natively, so there is nothing to
+> gate. Retained below for history and as the fallback design if the C shim is
+> ever the only available front-end.
+
 Before delegating to the real exec, the shim classifies the target binary:
 
 1. Read ELF header + program headers (not the whole file).
@@ -320,8 +466,9 @@ Extend the Docker harness (pattern: `make fuse-validate`) with
 - Laziness assertions: instrument the store (the `memStore.gets` pattern
   from `server/fuse/read_test.go`): opening one file faults only its
   chunks; `git log -1` faults < N chunks of the pack.
-- Exec gate: a static Go test binary is denied under `deny`, runs after
-  full sync under `materialize`.
+- Go/static coverage (seccomp, §3.3): a **static Go binary** reading a
+  workspace file gets correct content (the case the C shim could not cover) —
+  this replaces the retired exec-gate test.
 - go-git: in-process `status` (clean + after `sed -i`), `log`, `diff` on
   the fixture repo; status performs zero content reads when clean.
 - Finally on Fargate itself (manual or CI job): the same harness image as
@@ -329,36 +476,55 @@ Extend the Docker harness (pattern: `make fuse-validate`) with
 
 ## 10. Milestones
 
-1. **S1 — skeleton + supervisor**: `--shim` mode, skeleton builder, state
-   table, ENSURE materializer **with the pristine-placeholder check (§4.1
-   safeguard 1)**, unit tests. (No shim yet — exercised via a test client on
-   the socket.)
-2. **S2 — shim**: C library, open family + ENSURE, Docker validation of
-   the libc tool matrix.
-3. **S3 — exec gate**: classification + 3 policies, env re-injection.
-4. **S4 — mtime + .git**: manifest field, skeleton mtimes, `--include-git`
-   with scrub.
-5. **S5 — billy adapter**: `server/billyfs`, go-git demo + laziness tests.
-6. **S6 — Fargate validation**: harness as a Fargate task; document.
+1. **S1 — skeleton + supervisor**: ✅ done. `--shim` mode, skeleton builder,
+   state table, ENSURE materializer **with the pristine-placeholder check
+   (§4.1 safeguard 1)**, unit tests, e2e via a socket test client.
+2. **S2 — C shim**: ✅ done. open+fopen families + ENSURE, Docker validation
+   of the libc tool matrix (`make shim-validate`). Now demoted to fallback by
+   the §3.3 pivot.
+3. **#8 — seccomp viability spike**: ✅ done. PASSED on real Fargate (x86_64,
+   kernel 6.1.170, ptrace_scope=1). `spike/seccomp_unotify_probe.py`.
+4. **S3 — exec gate**: ❌ RETIRED (superseded by §3.3; seccomp covers Go/static).
+5. **S3′ — seccomp supervisor (NEW, primary path)**: C launcher + supervisor
+   notification loop (RECV/ID_VALID/ADDFD/SEND), path resolution from
+   registers, reuse `Ensure()` unchanged, supervisor as PID 1. Re-validate on
+   Fargate with a libc tool **and** a static Go binary reading a materialized
+   file; capture per-trap latency from `grep -R`. Delete the C shim once green.
+6. **S4 — mtime + .git**: manifest field, skeleton mtimes, `--include-git`
+   with scrub. (Independent of the interception mechanism.)
+7. **S5 — billy adapter**: `server/billyfs`, go-git demo + laziness tests.
+8. **S6 — Fargate validation**: full harness as a Fargate task; document.
 
-Reserved (not scheduled; foundation for write-back, tracked as its own
-issue): **namespace-syscall interception** (rename/unlink/mkdir/chmod…) per
-§4.1 safeguard 2, to turn the `local` set into a complete change ledger.
+Reserved (foundation for write-back, issue #21): **namespace-syscall
+interception** (rename/unlink/mkdir/chmod…) per §4.1 safeguard 2. Under seccomp
+(§3.3) this is just additional syscall numbers in the filter, not a new system.
 
-S1–S2 deliver standalone value (lazy libc tools); S4–S5 deliver git.
+S1–S2 delivered standalone value (lazy libc tools); S3′ generalizes it to all
+binaries; S4–S5 deliver git.
 
 ## 11. Open questions
 
-- **seccomp-unotify spike** (tracked separately): if a Fargate task can
-  install a user-notification filter + `ADDFD`, a uniform syscall-level
-  supervisor could replace the shim *and* the exec gate and cover Go
-  binaries. Shimmer's supervisor/materializer/state-table layers are
-  mechanism-agnostic and would be reused as-is; only §4–5 would retire.
-  Run the spike before S3 — a positive result reshapes the plan.
+- ~~**seccomp-unotify spike**~~ — **RESOLVED (2026-06-12): PASS on real
+  Fargate** (x86_64, kernel 6.1.170, ptrace_scope=1). Install + notify +
+  cross-process mem-read + respond all succeed unprivileged. The uniform
+  syscall-level supervisor (§3.3) is the chosen mechanism; §4–5 retire. Open
+  follow-ons it surfaced:
+  - **Performance (the next thing to measure):** every `openat` in the subtree
+    traps and blocks; real-workload latency (`go build`, `npm install`) is
+    unquantified. Needs a worker-pool supervisor and a measured budget.
+  - **ADDFD vs CONTINUE:** default to ADDFD (no TOCTOU); confirm flag/mode
+    fidelity for write-opens. Atomic `ADDFD_FLAG_SEND` is available on 6.1
+    (Linux 5.14+), but keep the two-step form for portability.
+  - **Topology under ptrace_scope=1:** supervisor must be an ancestor of the
+    workload → run it as PID 1 so daemonized (reparented) processes stay
+    descendants. Validate a double-forking workload.
+  - **arm64/Graviton Fargate:** untested on Fargate (local arm64 passed;
+    mechanism is arch-independent). Re-run the probe there before relying on it.
 - Placeholder representation: sparse files assumed; confirm the sandbox
   filesystem (Fargate ephemeral storage) preserves sparseness; fall back
   to truncated-empty + size-from-manifest-in-Stat if not.
 - `.git/config` scrub: parse with `gcfg`-style parser vs regex; decide in
   S4 review.
-- Should `materialize` policy prefetch in manifest order or fetch the
-  whole `.caidx` via desync's bulk path? (Reuse-over-reinvent review.)
+- Bulk prefetch (e.g. an exec that will read the whole tree): fetch in manifest
+  order or via desync's bulk `.caidx` path? (Reuse-over-reinvent review.) Note
+  the old `materialize` exec-gate policy is gone, but MATERIALIZE_ALL remains.
