@@ -194,6 +194,20 @@ that daemonizes (double-forks to reparent onto init) would otherwise escape the
 supervisor's subtree and become unreadable under scope=1 — but if the supervisor
 *is* init, every process in the task remains its descendant by construction.
 
+> **Deployment note — wiring an agent harness (READ THIS before running one).**
+> The agent harness and every tool it spawns MUST be descendants of
+> `mirage-server`, or the supervisor cannot read their memory (scope=1) and
+> interception fails. Concretely, in the sandbox/Fargate task:
+> `mirage-server --shim` is the container **entrypoint / PID 1**; it spawns the
+> launcher, which `execve`s the agent harness; the harness spawns tools beneath
+> it. Do **not** start the harness as a sibling of the server, from a separate
+> `docker exec`/`ECS exec` session, or via an init/supervisord that reparents
+> it — any of these breaks the ancestor relationship. If the harness must be
+> launched out-of-band, the alternatives are: set `kernel.yama.ptrace_scope=0`
+> (often not permitted on Fargate), or have the harness call
+> `PR_SET_PTRACER` to grant the server — both are fallbacks; the PID-1-ancestor
+> wiring is the supported path.
+
 ### The notification loop (per intercepted `open`)
 
 1. A tool calls `openat`; the kernel **pauses** it and queues a notification.
