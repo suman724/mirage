@@ -66,6 +66,11 @@ shim-validate: ## build a Linux image and run the Shimmer validation (C shim + l
 	docker build -t mirage-validate -f Dockerfile .
 	docker run --rm mirage-validate bash scripts/shim-validate.sh
 
+.PHONY: seccomp-validate
+seccomp-validate: ## build a Linux image and run the seccomp interception validation (C launcher + Go supervisor, incl. a static Go binary) — UNPRIVILEGED (needs Docker)
+	docker build -t mirage-validate -f Dockerfile .
+	docker run --rm mirage-validate bash scripts/seccomp-validate.sh
+
 .PHONY: vet
 vet: ## go vet
 	go vet ./...
