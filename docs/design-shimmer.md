@@ -26,7 +26,8 @@ Validated end-to-end UNPRIVILEGED (`make seccomp-server-validate`: real
 mirage-server --seccomp ← mirage-client over gRPC; libc tool + static Go binary
 read materialized files; health 200) and on real Fargate behind an ALB
 (gRPC target group, TLS via Service Connect). Remaining on §10/S3′: ADDFD
-hardening, per-open perf measurement, and retiring the C shim.
+hardening, per-open perf measurement, and deciding the C shim's fate (keep as
+the no-seccomp fallback, or delete).
 
 **Scope:** server-side only. The wire protocol gains one field (mtime); the
 client gains one opt-in flag (.git indexing). Everything else is additive.
@@ -517,7 +518,9 @@ Extend the Docker harness (pattern: `make fuse-validate`) with
    workload as its child) with a gRPC + HTTP health endpoint. Validated
    UNPRIVILEGED (`make seccomp-server-validate`) and on real Fargate behind an
    ALB. Remaining: **ADDFD** hardening (race-free fd injection), **per-trap
-   latency** measurement, and **deleting the C shim**.
+   latency** measurement, and **deciding the C shim's fate** (keep as the
+   no-seccomp fallback, or delete — it's superseded but is the only option where
+   a runtime forbids installing a seccomp filter).
 6. **S4 — mtime + .git**: manifest field, skeleton mtimes, `--include-git`
    with scrub. (Independent of the interception mechanism.)
 7. **S5 — billy adapter**: `server/billyfs`, go-git demo + laziness tests.
