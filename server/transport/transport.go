@@ -527,22 +527,30 @@ func (s *Server) serveSeccomp(ctx context.Context, m *chunk.Manifest, store desy
 
 	// Spawn launcher+workload as OUR child (so we are its ancestor). The
 	// launcher installs the seccomp filter, hands us the listener fd over
-	// sockPath, waits for our ack, then execs the workload.
+	// sockPath, waits for our ack, then execs the workload. Setpgid puts the
+	// workload (and every tool it spawns) in its own process group so we can
+	// tear the whole subtree down cleanly on disconnect — not just the direct
+	// child. (NOTE: when mirage-server is PID 1, it should also reap orphaned
+	// descendants; that subreaper concern is deployment-level, tracked in #3.)
 	child := exec.Command(s.launcher, s.workload...)
 	child.Env = append(os.Environ(), "MIRAGE_SUPERVISOR_SOCK="+sockPath)
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := child.Start(); err != nil {
 		res.Err = fmt.Errorf("transport: start launcher %q: %w", s.launcher, err)
 		return res
 	}
+	s.log.Info("launched workload under seccomp launcher",
+		"launcher", s.launcher, "workload", s.workload, "pid", child.Process.Pid)
 
 	listenerFd, conn, err := seccomp.RecvListenerFd(ln)
 	if err != nil {
-		_ = child.Process.Kill()
+		s.killGroup(child)
 		_, _ = child.Process.Wait()
 		res.Err = fmt.Errorf("transport: receive listener fd: %w", err)
 		return res
 	}
+	s.log.Debug("received seccomp listener fd from launcher", "fd", listenerFd)
 
 	workers := s.workers
 	if workers <= 0 {
@@ -578,8 +586,8 @@ func (s *Server) serveSeccomp(ctx context.Context, m *chunk.Manifest, store desy
 			s.log.Info("workload exited cleanly")
 		}
 	case <-ctx.Done():
-		s.log.Info("client disconnected; terminating workload")
-		_ = child.Process.Kill()
+		s.log.Info("client disconnected; terminating workload subtree")
+		s.killGroup(child)
 		<-cmdErr
 	}
 
@@ -587,6 +595,20 @@ func (s *Server) serveSeccomp(ctx context.Context, m *chunk.Manifest, store desy
 	<-serveErr
 	_ = syscall.Close(listenerFd)
 	return res
+}
+
+// killGroup SIGKILLs the workload's whole process group (the workload plus any
+// tools it spawned), set up via Setpgid at launch. Falls back to killing just
+// the process if the group send fails.
+func (s *Server) killGroup(child *exec.Cmd) {
+	if child.Process == nil {
+		return
+	}
+	// Negative pid targets the process group whose leader is child.Process.Pid.
+	if err := syscall.Kill(-child.Process.Pid, syscall.SIGKILL); err != nil {
+		s.log.Debug("kill workload process group; falling back to single process", "err", err)
+		_ = child.Process.Kill()
+	}
 }
 
 // serveMount FUSE-mounts the manifest at mountDir, backed by the store chain,

@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -155,7 +156,11 @@ func serveHealth(addr string, log *slog.Logger) {
 		_, _ = io.WriteString(w, "ok\n")
 	})
 	log.Info("health endpoint listening", "addr", addr, "path", "/healthz")
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second, // bound slow-header clients
+	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Error("health endpoint failed", "err", err)
 	}

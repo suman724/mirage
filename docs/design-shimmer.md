@@ -17,6 +17,17 @@ shim (§4) and exec gate (§5) are **superseded** by §3.3 (shim demoted to
 fallback; exec gate not being built). The supervisor/state-table/materializer
 /store-chain core (§3.1–3.2) is **reused unchanged** under either front-end.
 
+**SHIPPED (2026-06-13): seccomp is wired into `mirage-server` as `--seccomp`.**
+mirage-server is the entrypoint (run it as PID 1); on each connection it builds
+the skeleton, spawns the C launcher + workload as its own child (so it is the
+workload's ancestor), and services open() traps in-process. Added: a gRPC
+health service + optional HTTP `--health-addr /healthz` for ALB health checks.
+Validated end-to-end UNPRIVILEGED (`make seccomp-server-validate`: real
+mirage-server --seccomp ← mirage-client over gRPC; libc tool + static Go binary
+read materialized files; health 200) and on real Fargate behind an ALB
+(gRPC target group, TLS via Service Connect). Remaining on §10/S3′: ADDFD
+hardening, per-open perf measurement, and retiring the C shim.
+
 **Scope:** server-side only. The wire protocol gains one field (mtime); the
 client gains one opt-in flag (.git indexing). Everything else is additive.
 **Background:** `docs/mirage-on-fargate.md` (plain-language analysis of why
@@ -499,11 +510,14 @@ Extend the Docker harness (pattern: `make fuse-validate`) with
 3. **#8 — seccomp viability spike**: ✅ done. PASSED on real Fargate (x86_64,
    kernel 6.1.170, ptrace_scope=1). `spike/seccomp_unotify_probe.py`.
 4. **S3 — exec gate**: ❌ RETIRED (superseded by §3.3; seccomp covers Go/static).
-5. **S3′ — seccomp supervisor (NEW, primary path)**: C launcher + supervisor
-   notification loop (RECV/ID_VALID/ADDFD/SEND), path resolution from
-   registers, reuse `Ensure()` unchanged, supervisor as PID 1. Re-validate on
-   Fargate with a libc tool **and** a static Go binary reading a materialized
-   file; capture per-trap latency from `grep -R`. Delete the C shim once green.
+5. **S3′ — seccomp supervisor (NEW, primary path)**: ✅ largely done. C launcher
+   + supervisor notification loop (RECV/ID_VALID, CONTINUE-after-materialize),
+   path resolution from registers, reuse `Ensure()` unchanged. **Wired into
+   `mirage-server` as `--seccomp`** (supervisor as PID 1, spawns launcher +
+   workload as its child) with a gRPC + HTTP health endpoint. Validated
+   UNPRIVILEGED (`make seccomp-server-validate`) and on real Fargate behind an
+   ALB. Remaining: **ADDFD** hardening (race-free fd injection), **per-trap
+   latency** measurement, and **deleting the C shim**.
 6. **S4 — mtime + .git**: manifest field, skeleton mtimes, `--include-git`
    with scrub. (Independent of the interception mechanism.)
 7. **S5 — billy adapter**: `server/billyfs`, go-git demo + laziness tests.

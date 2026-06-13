@@ -353,14 +353,24 @@ in [`docs/mirage-on-fargate.md`](./mirage-on-fargate.md).
 ```bash
 # The whole seccomp path, end to end, in an UNPRIVILEGED Linux container
 # (no devices, no capabilities — the Fargate property). Needs Docker.
-make seccomp-validate
+make seccomp-validate         # the mechanism: launcher + supervisor + workload matrix
+make seccomp-server-validate  # the PRODUCTION path: mirage-server --seccomp <- mirage-client over gRPC
 ```
 
-That harness chunks a fixture, builds the skeleton, starts the supervisor,
+`seccomp-validate` chunks a fixture, builds the skeleton, starts the supervisor,
 launches workloads under the filter, and asserts that a libc tool (`cat`,
 `python3`, `grep -r`) **and a statically-linked Go binary** all read materialized
 files byte-for-byte correctly, that untouched files stay sparse (laziness holds),
 and that a placeholder's zeros are never observed.
+
+`seccomp-server-validate` runs the real thing: `mirage-server --seccomp /ws --
+<workload>` as the entrypoint, with the real `mirage-client` dialing in over
+gRPC to publish a directory. The server builds the skeleton, launches the
+workload under the C launcher, and materializes files (faulting chunks from the
+client over the wire) as the workload reads them — and asserts the HTTP
+`/healthz` endpoint answers 200 for load-balancer health checks. This mirrors
+the validated Fargate deployment (ALB gRPC target group + TLS → mirage-server
+PID 1 → launcher → workload).
 
 ---
 
@@ -372,10 +382,15 @@ a paused process's memory, materialize-on-open through the reused chunk store,
 and end-to-end correctness for libc tools **and** a static Go binary — the case
 the old `LD_PRELOAD` shim could never cover.
 
+Also done: the seccomp path is **wired into `mirage-server` as `--seccomp`**
+(the server is the entrypoint/PID 1, launches the workload under the C launcher,
+and supervises in-process), with a gRPC + HTTP health endpoint for load
+balancers — and it's been **validated on a real ECS Fargate task behind an ALB**
+(gRPC target group, TLS terminated at the ALB / re-encrypted to a Service
+Connect sidecar / plaintext to the server).
+
 **Next (not yet done):**
 
-- **Re-validate on a real Fargate task.** The local run is Docker; the viability
-  spike already passed on Fargate, but the full path should be confirmed there.
 - **ADDFD hardening** (§7), for untrusted workloads.
 - **Measure per-open overhead** on real workloads and tune (a worker pool already
   services pauses concurrently).
