@@ -1,5 +1,8 @@
 version: v2
-clean: true
+# clean MUST stay false: the output dir (proto/) is also where the .proto
+# SOURCE lives, and `clean: true` wipes that dir before generating — which
+# silently deletes mirage.proto. (That is how the source was lost once.)
+clean: false
 plugins:
   - local: protoc-gen-go
     out: proto

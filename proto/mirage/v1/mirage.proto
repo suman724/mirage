@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+// Mirage — wire protocol for the lazy workspace filesystem.
+// A full local-looking filesystem on the sandbox that is secretly remote:
+// files materialize only when touched.
+//
+// CONNECTION MODEL (see design §3):
+//   The CLIENT opens exactly one bidirectional stream by calling Connect().
+//   The client is behind NAT/firewall; the server NEVER dials the client.
+//   Once the stream is open it is FULL-DUPLEX: the server originates
+//   requests (e.g. ChunkRequest) by sending ServerFrame down the stream the
+//   client opened. This separates "who opens the socket" (client) from
+//   "who originates a request" (either side).
+//
+// SECURITY (see design §6):
+//   Reads are CHUNK-HASH based, not path based. The server can only ask for
+//   chunk hashes present in the index the client published. It cannot name a
+//   path like ~/.ssh/id_rsa, because secret files are excluded at index-build
+//   time and their chunks are never published.
+package mirage.v1;
+
+option go_package = "github.com/suman724/mirage/proto/mirage/v1;miragev1";
+
+// Sent by the client (the side that opened the connection).
+message ClientFrame {
+  oneof payload {
+    Hello hello = 1; // first frame: auth + workspace handshake
+    IndexPublish index_publish = 2; // the desync index (manifest of chunk hashes)
+    ChunkResponse chunk_response = 3; // answer to a server ChunkRequest
+    WriteBackResult write_back_result = 4; // result of applying a write-back batch
+    PermissionResult permission_result = 5; // user's answer to a prompt
+    UserInput user_input = 6; // user typed something in the TUI
+    Heartbeat heartbeat = 7;
+  }
+}
+
+// Sent by the server (the sandbox) — over the stream the client opened.
+message ServerFrame {
+  oneof payload {
+    HelloAck hello_ack = 1;
+    ChunkRequest chunk_request = 2; // server needs a chunk to satisfy a read
+    WriteBackBatch write_back_batch = 3; // sandbox edited files; apply to client workspace
+    PermissionRequest permission_request = 4; // gate a risky action on the client
+    AgentEvent agent_event = 5; // stream agent output to the TUI
+    Heartbeat heartbeat = 6;
+  }
+}
+
+message Hello {
+  string session_token = 1; // short-lived, connection-bound
+  string client_version = 2;
+  string os = 3; // "windows" | "darwin"
+  WorkspaceMeta workspace = 4;
+}
+
+message WorkspaceMeta {
+  string root_name = 1; // display name only; never an absolute host path
+  bool is_git = 2;
+  string git_remote_url = 3; // empty if none reachable
+  string git_head_commit = 4; // commit the working-tree delta is relative to
+}
+
+message HelloAck {
+  string sandbox_id = 1;
+  bool resume = 2; // true if a warm snapshot was reused
+}
+
+// The desync index: the ordered list of chunk hashes that make up the tree
+// (or, in the git fast-path, just the working-tree delta). Small relative to
+// the tree. Sent up front; chunk *contents* are faulted lazily afterward.
+message IndexPublish {
+  bytes caidx = 1; // serialized desync index (or a chunked stream of it)
+  uint32 total_chunks = 2;
+  uint64 total_bytes = 3; // logical size of the materialized tree
+  bool is_delta = 4; // true => overlay on top of a git clone
+}
+
+message ChunkRequest {
+  uint64 request_id = 1;
+  repeated bytes chunk_hashes = 2; // batch of content hashes the FUSE layer faulted on
+}
+
+message ChunkResponse {
+  uint64 request_id = 1;
+  repeated Chunk chunks = 2;
+  // Client MUST only serve hashes present in the published index. Unknown or
+  // excluded hashes => error, not data.
+  string error = 3;
+}
+
+message Chunk {
+  bytes hash = 1; // content hash (id)
+  bytes data = 2; // raw chunk bytes (may be desync-compressed)
+  bool compressed = 3;
+}
+
+message WriteBackBatch {
+  uint64 batch_id = 1;
+  repeated FileChange changes = 2;
+}
+
+message FileChange {
+  Kind kind = 1;
+  string rel_path = 2; // relative to workspace root; traversal outside rejected
+  bytes base_hash = 3; // content hash at publish time, for conflict detection
+  repeated bytes new_chunk_hashes = 4; // new content as chunks (data via ChunkRequest reverse, or inline)
+  repeated Chunk inline_chunks = 5; // small files may inline their chunks
+
+  enum Kind {
+    MODIFY = 0;
+    CREATE = 1;
+    DELETE = 2;
+  }
+}
+
+message WriteBackResult {
+  uint64 batch_id = 1;
+  repeated FileApply applied = 2;
+}
+
+message FileApply {
+  string rel_path = 1;
+  Status status = 2;
+  string detail = 3;
+
+  enum Status {
+    APPLIED = 0;
+    CONFLICT = 1;
+    REJECTED = 2;
+  }
+}
+
+message PermissionRequest {
+  uint64 request_id = 1;
+  string summary = 2; // e.g. "run: rm -rf build/" or "apply 3 file changes"
+  string detail = 3;
+  repeated string options = 4; // e.g. ["Allow", "Allow once", "Deny"]
+}
+
+message PermissionResult {
+  uint64 request_id = 1;
+  string chosen = 2;
+}
+
+message AgentEvent {
+  Kind kind = 1;
+  string text = 2;
+
+  enum Kind {
+    ASSISTANT_TEXT = 0;
+    TOOL_BEGIN = 1;
+    TOOL_END = 2;
+    STATUS = 3;
+  }
+}
+
+message UserInput {
+  string text = 1;
+}
+
+message Heartbeat {
+  uint64 nonce = 1;
+}
+
+service Mirage {
+  // The ONLY entry point. Client initiates; both sides then exchange frames.
+  // ClientFrame flows client->server, ServerFrame flows server->client.
+  rpc Connect(stream ClientFrame) returns (stream ServerFrame);
+}
