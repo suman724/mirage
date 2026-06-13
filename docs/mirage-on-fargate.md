@@ -5,10 +5,19 @@ LD_PRELOAD, or "syscall interception." Everything is explained from scratch.
 Read `how-mirage-works.md` first if you haven't — this doc assumes you know
 what the Mirage client and server do, but nothing else.
 
-If you only remember one sentence: **Fargate forbids the kernel feature
-(FUSE) that Mirage's lazy file mount needs, and every workaround trades away
-either correctness or laziness — the only fully-correct cheap option is to
-run on EC2 instead.**
+> **OUTCOME (2026-06-13): solved.** This doc is the original *analysis* of the
+> options. The winning option — **seccomp user notification (§6 Option B)** —
+> was proven on a real Fargate task and is now **implemented and validated**:
+> it ships as `mirage-server --seccomp` and ran end-to-end on Fargate behind an
+> ALB. So Fargate is no longer a blocker and EC2 is no longer required. Where
+> this doc says seccomp is "unproven / needs a live test," read it as
+> historical — see `how-shimmer-works.md` and `design-shimmer.md` §3.3 for the
+> built system. The rest of the analysis is preserved as the reasoning trail.
+
+If you only remember one sentence: **Fargate forbids the kernel feature (FUSE)
+that Mirage's lazy file mount needs, but seccomp user-notification gives the
+same lazy workspace with zero privileges — and that is now built, shipped as
+`--seccomp`, and validated on real Fargate.**
 
 ---
 
@@ -225,7 +234,7 @@ measured overheads range from ~10% to ~80% on syscall-heavy workloads
 (an optimization using seccomp to skip boring syscalls gets it to ~9–25%,
 but we haven't verified that optimization works on Fargate).
 
-### Option B: seccomp user notification (the elegant one, but unproven there)
+### Option B: seccomp user notification (the elegant one — CHOSEN, now proven on Fargate)
 
 **seccomp** is a kernel feature for filtering system calls. Its modern
 extension, "user notification," lets a supervisor process *service* a
@@ -414,25 +423,26 @@ Go, zero privileges — runs on Fargate today.
 | Reconstruct (`--out`) | ✅ (real files) | ❌ none — full upfront copy | ✅ | already built |
 | LD_PRELOAD shim | ❌ silently misses them | ❌ per-file (materialize-on-open) | ✅ | medium + permanent upkeep |
 | ptrace supervisor | ✅ | ❌ per-file | ✅ proven (Falco) | high |
-| seccomp user notification | ✅ | ❌ per-file | ❓ likely, needs a live test | high |
+| **seccomp user notification (CHOSEN)** | ✅ | ❌ per-file | ✅ **proven + shipped** (`--seccomp`) | high |
 | Custom Go `fs.FS` | ❌ only Go code written to accept it; no subprocesses | ✅ per-chunk | ✅ | low (~300 LOC) |
 | Hybrid: fs.FS + shim + exec gate (§8) | ✅ correct for all (Go tools trigger full materialize) | mixed: per-chunk → per-file → none | ✅ | high |
 
-Recommendation, in order:
+Recommendation, in order — **what we actually did is #1 below (it worked):**
 
-1. **If the launch type is negotiable, use ECS on EC2 and keep FUSE.** Same
-   task definitions, but you control the host, so `/dev/fuse` and
-   `CAP_SYS_ADMIN` are available. The mount code already exists and is
-   validated; everything else in this doc is a workaround for one AWS
-   restriction.
-2. **If Fargate is a hard requirement**, build materialize-on-open backed by
-   the existing chunk store (the store chain needs no changes), and choose
-   the interception layer by stakes: LD_PRELOAD for a quick prototype with a
-   *documented* "Go tools see an empty directory" blind spot; ptrace or
-   seccomp-notification for correctness. Run the seccomp-on-Fargate
-   experiment first — it's cheap and decides the architecture.
+1. **On Fargate, use seccomp user-notification (Option B).** The cheap
+   on-Fargate experiment was run and **passed**; the full path was then built
+   (`mirage-server --seccomp`, materialize-on-open backed by the existing chunk
+   store — the store chain needed no changes) and **validated on real Fargate
+   behind an ALB**. It catches every binary (Go/static included) at the syscall
+   layer. This is the shipped answer; see `how-shimmer-works.md`.
+2. **ECS on EC2 + FUSE** remains valid if you prefer per-*chunk* laziness (FUSE
+   keeps it; seccomp is per-*file*) and the launch type is negotiable. The
+   mount code exists and is validated.
 3. **`--out` reconstruct mode is the zero-risk fallback** that ships on
    Fargate today, if upfront transfer cost is acceptable.
+4. **LD_PRELOAD shim** survives only as a fallback for environments where a
+   seccomp filter can't be installed — with its documented "Go/static tools see
+   an empty directory" blind spot.
 
 ---
 

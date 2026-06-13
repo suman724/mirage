@@ -361,6 +361,23 @@ cache (and the kernel's own page cache) serve them with no network at all.
 > over gRPC, files read *through the kernel* (faulting chunks over the wire),
 > bytes verified, and a warm re-read served with no new network traffic.
 
+### When FUSE isn't allowed: Shimmer
+
+FUSE needs a kernel device (`/dev/fuse`) and a privileged capability
+(`CAP_SYS_ADMIN`). Some locked-down container platforms — **AWS Fargate** is the
+headline — forbid both. For those, Mirage has a second lazy-workspace
+implementation called **Shimmer** that needs **zero kernel privileges**: it
+builds a real directory of sparse placeholder files (so `ls`/`find`/`stat` work
+natively) and materializes each file's content on first *open*, intercepted at
+the **syscall layer** via Linux **seccomp user-notification** (a tiny C launcher
+installs the filter; `mirage-server` is the supervisor). It reuses everything in
+this doc — chunks, the manifest, the store stack, the outbound-only connection —
+and only swaps the "what triggers a fetch" mechanism. This is the
+production mode behind `mirage-server --seccomp`, validated on real Fargate
+behind an ALB. The full plain-language tour is in
+[`docs/how-shimmer-works.md`](./how-shimmer-works.md); the design is
+[`docs/design-shimmer.md`](./design-shimmer.md).
+
 ---
 
 ## 10. The code, mapped to the ideas
@@ -370,17 +387,19 @@ cache (and the kernel's own page cache) serve them with no network at all.
 | Chunk hash, manifest, CDC split | `internal/chunk` (uses desync) |
 | Walk dir, exclude secrets, build manifest + store | `client/index`, `client/chunkstore` |
 | Dial out, publish, answer/reject chunk requests | `client/transport` |
-| Accept the connection, drive the protocol (reconstruct *or* mount) | `server/transport` |
+| Accept the connection, drive the protocol (4 modes) | `server/transport` |
 | The custom Store that fetches over the pipe | `server/channelstore` |
 | Cache + dedup + single-flight (reused from desync) | desync `Cache` + `DedupQueue` in `server/transport` |
-| Lazy POSIX reads via a mounted tree | `server/fuse` |
+| Lazy POSIX reads via a mounted tree (FUSE) | `server/fuse` |
+| FUSE-free lazy workspace: skeleton + materialize-on-open (Shimmer) | `server/shim` (core), `server/seccomp` + `shim/launcher.c` (seccomp), `shim/mirageshim.c` (LD_PRELOAD fallback) |
 | The wire protocol (single source of truth) | `proto/mirage/v1/mirage.proto` |
 | Structured logging | `internal/logging` |
 | End-to-end tests over real gRPC (reconstruct + live FUSE) | `test/` |
 
 Two runnable binaries tie it together: `client/` (dials out, serves chunks) and
-`server/` (accepts, then either reconstructs into `--out` or FUSE-mounts at
-`--mount`). Both take `--log-level`/`--log-format`.
+`server/` (accepts, then reconstructs into `--out`, FUSE-mounts at `--mount`, or
+projects a lazy skeleton at `--shim`/`--seccomp`). Both take
+`--log-level`/`--log-format`.
 
 ---
 
@@ -398,12 +417,19 @@ diff -r testdata/workspace ./mirage-out   # only the excluded secrets differ
 
 # Live FUSE mount + full-loop harness, in a Linux container (needs Docker):
 make fuse-validate
+
+# Shimmer (FUSE-free), in an UNPRIVILEGED Linux container (needs Docker):
+make seccomp-server-validate  # the production path: mirage-server --seccomp <- client over gRPC
+make seccomp-validate         # the seccomp mechanism (launcher + supervisor + tool matrix)
+make shim-validate            # the LD_PRELOAD fallback
 ```
 
 Add `--log-level debug` to the client to watch individual chunks being served,
 and to the server to watch cache hits vs. network faults. For the mount path,
 run the server with `--mount <dir>` (needs a FUSE module: macFUSE on macOS,
-`/dev/fuse` on Linux).
+`/dev/fuse` on Linux). For the FUSE-free path on a locked-down platform, run
+`mirage-server --seccomp <dir> -- <workload>` (see
+[`docs/how-shimmer-works.md`](./how-shimmer-works.md)).
 
 ---
 
@@ -417,6 +443,11 @@ end-to-end: reconstruction is byte-for-byte correct, and a **real POSIX read on
 the FUSE mount faults chunks over the channel** — validated live in a Linux
 container by a full client+server harness (read through the kernel → fault over
 the wire → warm re-read free). The whole suite passes under the race detector.
+
+Also built and validated: **Shimmer**, the FUSE-free lazy workspace for
+privilege-restricted platforms (skeleton + materialize-on-open via seccomp
+syscall interception), wired into `mirage-server --seccomp` and proven on real
+AWS Fargate behind an ALB. See [`docs/how-shimmer-works.md`](./how-shimmer-works.md).
 
 **Next (not yet done):**
 
