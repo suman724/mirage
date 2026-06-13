@@ -14,9 +14,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/folbricht/desync"
@@ -29,8 +32,12 @@ import (
 	miragev1 "github.com/suman724/mirage/proto/mirage/v1"
 	"github.com/suman724/mirage/server/channelstore"
 	miragefuse "github.com/suman724/mirage/server/fuse"
+	"github.com/suman724/mirage/server/seccomp"
 	"github.com/suman724/mirage/server/shim"
 )
+
+// defaultSeccompWorkers is the notification-handler pool size when unset.
+const defaultSeccompWorkers = 8
 
 // Result summarizes one completed reconstruction. It is delivered to the
 // OnResult callback (used by tests and the CLI) once a connection's index has
@@ -61,20 +68,38 @@ type ShimInfo struct {
 	Requests   func() uint64 // live count of chunks faulted over the wire so far
 }
 
+// SeccompInfo is reported once a connection's workspace skeleton is built and
+// the seccomp supervisor is servicing the workload's open() traps (seccomp
+// mode, design §3.3). This is the production Shimmer mode: mirage-server is the
+// container entrypoint (PID 1), launches the workload under the C launcher
+// (so the server is an ancestor — the ptrace_scope=1 requirement), and
+// materializes files as the workload opens them.
+type SeccompInfo struct {
+	Root     string        // workspace root holding the skeleton (symlink-resolved)
+	StateDir string        // journal + chunk cache location for this session
+	Workload []string      // the command launched under interception
+	Requests func() uint64 // live count of chunks faulted over the wire so far
+}
+
 // Server implements miragev1.MirageServer. Per connection it either
 // reconstructs the published index into outDir (reconstruct mode) or FUSE-mounts
 // it at mountDir so reads fault chunks lazily (mount mode).
 type Server struct {
 	miragev1.UnimplementedMirageServer
-	outDir    string
-	mountDir  string
-	shimDir   string
-	stateDir  string // shim mode: journal + cache + socket; empty = per-connection temp
-	sandboxID string
-	onResult  func(Result)
-	onMounted func(MountInfo)
-	onShim    func(ShimInfo)
-	log       *slog.Logger
+	outDir     string
+	mountDir   string
+	shimDir    string
+	seccompDir string   // seccomp mode: workspace projection root
+	stateDir   string   // shim/seccomp mode: journal + cache + socket; empty = per-connection temp
+	launcher   string   // seccomp mode: path to the mirage-launcher binary
+	workload   []string // seccomp mode: command run under interception
+	workers    int      // seccomp mode: concurrent notification handlers (0 => default)
+	sandboxID  string
+	onResult   func(Result)
+	onMounted  func(MountInfo)
+	onShim     func(ShimInfo)
+	onSeccomp  func(SeccompInfo)
+	log        *slog.Logger
 }
 
 // New returns a Server that reconstructs published trees into outDir. onResult
@@ -116,6 +141,34 @@ func NewShimmer(shimDir, stateDir string, onShim func(ShimInfo), logger *slog.Lo
 		sandboxID: "mirage-sandbox-0",
 		onShim:    onShim,
 		log:       logging.OrDefault(logger),
+	}
+}
+
+// NewSeccomp returns a Server running the production Shimmer mode: it projects
+// each published workspace into seccompDir as a sparse skeleton and runs as the
+// seccomp supervisor, materializing files as the workload opens them (covering
+// every binary — libc, Go, static — at the syscall layer; design §3.3).
+//
+// On each connection, after the skeleton is built, the server spawns
+// `launcher workload...` as its own CHILD — so mirage-server is an ancestor of
+// the workload, which ptrace_scope=1 requires for reading the trapped process's
+// memory. Deploy mirage-server as the container entrypoint (PID 1) so every
+// process in the task stays its descendant (see the §3.3 deployment note).
+//
+// stateDir holds the state journal, chunk cache, and the launcher hand-off
+// socket; empty uses a per-connection temp dir (no restart recovery). workers
+// is the notification-handler pool size (0 => a sensible default). onSeccomp
+// may be nil. logger may be nil.
+func NewSeccomp(seccompDir, stateDir, launcher string, workload []string, workers int, onSeccomp func(SeccompInfo), logger *slog.Logger) *Server {
+	return &Server{
+		seccompDir: seccompDir,
+		stateDir:   stateDir,
+		launcher:   launcher,
+		workload:   workload,
+		workers:    workers,
+		sandboxID:  "mirage-sandbox-0",
+		onSeccomp:  onSeccomp,
+		log:        logging.OrDefault(logger),
 	}
 }
 
@@ -266,10 +319,16 @@ func (s *Server) mode() string {
 		return "mount"
 	case s.shimDir != "":
 		return "shim"
+	case s.seccompDir != "":
+		return "seccomp"
 	default:
 		return "reconstruct"
 	}
 }
+
+// projecting reports whether this server projects a real skeleton on disk
+// (shim or seccomp mode), which needs a state dir for the journal + cache.
+func (s *Server) projecting() bool { return s.shimDir != "" || s.seccompDir != "" }
 
 // sessionDirs resolves where this connection's state journal (shim mode) and
 // chunk cache live, returning a cleanup for whatever is session-scoped. A
@@ -278,14 +337,14 @@ func (s *Server) mode() string {
 func (s *Server) sessionDirs() (stateDir, cacheDir string, cleanup func(), err error) {
 	cleanup = func() {}
 	switch {
-	case s.shimDir != "" && s.stateDir != "":
+	case s.projecting() && s.stateDir != "":
 		stateDir = s.stateDir
 		// 0700: the state dir holds the supervisor socket and is its trust
 		// boundary (design §4).
 		if err := os.MkdirAll(stateDir, 0o700); err != nil {
 			return "", "", nil, fmt.Errorf("create state dir %q: %w", stateDir, err)
 		}
-	case s.shimDir != "":
+	case s.projecting():
 		tmp, err := os.MkdirTemp("", "mirage-shim-")
 		if err != nil {
 			return "", "", nil, fmt.Errorf("create temp state dir: %w", err)
@@ -318,6 +377,8 @@ func (s *Server) drive(ctx context.Context, m *chunk.Manifest, store desync.Stor
 		return s.serveMount(ctx, m, store, cs)
 	case s.shimDir != "":
 		return s.serveShim(ctx, m, store, cs, stateDir)
+	case s.seccompDir != "":
+		return s.serveSeccomp(ctx, m, store, cs, stateDir)
 	default:
 		return s.reconstruct(ctx, m, store)
 	}
@@ -398,6 +459,133 @@ func (s *Server) serveShim(ctx context.Context, m *chunk.Manifest, store desync.
 
 	res.Files = skel.Files
 	res.Bytes = skel.Bytes
+	return res
+}
+
+// serveSeccomp is the production Shimmer driver (design §3.3). It builds the
+// skeleton, then launches the workload under the C launcher as a CHILD of this
+// process and services its open() traps via seccomp user-notification —
+// materializing files through the same shim.Materializer the socket front-end
+// uses. Because the launcher is our child, mirage-server is an ancestor of the
+// workload, satisfying the ptrace_scope=1 memory-read requirement (run
+// mirage-server as PID 1 so daemonized descendants stay in the tree).
+//
+// Lifecycle: serve until the workload exits or the client disconnects, then
+// stop the supervisor. Unlike mount mode there is nothing to unmount; whatever
+// was materialized or written stays on disk.
+func (s *Server) serveSeccomp(ctx context.Context, m *chunk.Manifest, store desync.Store, cs *channelstore.Store, stateDir string) Result {
+	res := Result{TotalRefs: uint64(m.TotalChunks())}
+	if len(s.workload) == 0 {
+		res.Err = fmt.Errorf("transport: seccomp mode requires a workload command")
+		return res
+	}
+	if err := os.MkdirAll(s.seccompDir, 0o755); err != nil {
+		res.Err = fmt.Errorf("transport: create seccomp dir %q: %w", s.seccompDir, err)
+		return res
+	}
+	table, err := shim.OpenTable(filepath.Join(stateDir, "journal.jsonl"), s.log)
+	if err != nil {
+		res.Err = fmt.Errorf("transport: open seccomp state: %w", err)
+		return res
+	}
+	defer func() {
+		if err := table.Close(); err != nil {
+			s.log.Warn("close seccomp state journal", "err", err)
+		}
+	}()
+
+	buildTime := time.Now()
+	skel, err := shim.BuildSkeleton(s.seccompDir, m, table, buildTime, s.log)
+	if err != nil {
+		res.Err = fmt.Errorf("transport: build skeleton: %w", err)
+		return res
+	}
+	res.Files = skel.Files
+	res.Bytes = skel.Bytes
+
+	mat, err := shim.NewMaterializer(s.seccompDir, m, store, table, buildTime, s.log)
+	if err != nil {
+		res.Err = fmt.Errorf("transport: build materializer: %w", err)
+		return res
+	}
+	sup, err := seccomp.New(mat, s.log)
+	if err != nil {
+		// On non-Linux this is seccomp.ErrUnsupported (the mode is Linux-only).
+		res.Err = fmt.Errorf("transport: start seccomp supervisor: %w", err)
+		return res
+	}
+
+	// Unix socket on which the launcher hands us the seccomp listener fd.
+	sockPath := filepath.Join(stateDir, "launcher.sock")
+	_ = os.Remove(sockPath) // clear any stale socket
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		res.Err = fmt.Errorf("transport: listen launcher socket: %w", err)
+		return res
+	}
+	defer ln.Close()
+
+	// Spawn launcher+workload as OUR child (so we are its ancestor). The
+	// launcher installs the seccomp filter, hands us the listener fd over
+	// sockPath, waits for our ack, then execs the workload.
+	child := exec.Command(s.launcher, s.workload...)
+	child.Env = append(os.Environ(), "MIRAGE_SUPERVISOR_SOCK="+sockPath)
+	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := child.Start(); err != nil {
+		res.Err = fmt.Errorf("transport: start launcher %q: %w", s.launcher, err)
+		return res
+	}
+
+	listenerFd, conn, err := seccomp.RecvListenerFd(ln)
+	if err != nil {
+		_ = child.Process.Kill()
+		_, _ = child.Process.Wait()
+		res.Err = fmt.Errorf("transport: receive listener fd: %w", err)
+		return res
+	}
+
+	workers := s.workers
+	if workers <= 0 {
+		workers = defaultSeccompWorkers
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- sup.Serve(listenerFd, workers) }()
+
+	// Ack the launcher so it execs the workload — only now that the supervisor
+	// is servicing, so the workload's first open is answered, not dropped.
+	if _, err := conn.Write([]byte("OK\n")); err != nil {
+		s.log.Warn("ack launcher", "err", err)
+	}
+	conn.Close()
+
+	if s.onSeccomp != nil {
+		s.onSeccomp(SeccompInfo{
+			Root:     mat.Root(),
+			StateDir: stateDir,
+			Workload: s.workload,
+			Requests: cs.Requests,
+		})
+	}
+
+	// Run until the workload exits or the client disconnects.
+	cmdErr := make(chan error, 1)
+	go func() { cmdErr <- child.Wait() }()
+	select {
+	case err := <-cmdErr:
+		if err != nil {
+			s.log.Info("workload exited", "err", err)
+		} else {
+			s.log.Info("workload exited cleanly")
+		}
+	case <-ctx.Done():
+		s.log.Info("client disconnected; terminating workload")
+		_ = child.Process.Kill()
+		<-cmdErr
+	}
+
+	sup.Stop()
+	<-serveErr
+	_ = syscall.Close(listenerFd)
 	return res
 }
 

@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/folbricht/desync"
-	"golang.org/x/sys/unix"
 
 	"github.com/suman724/mirage/client/index"
 	"github.com/suman724/mirage/internal/chunk"
@@ -107,7 +106,7 @@ func main() {
 	}
 
 	// 6. Receive the listener fd, start servicing, then ack so the launcher execs.
-	listenerFd, conn, err := acceptListenerFd(ln)
+	listenerFd, conn, err := seccomp.RecvListenerFd(ln)
 	if err != nil {
 		log.Error("receive listener fd", "err", err)
 		_ = child.Process.Kill()
@@ -138,38 +137,6 @@ func main() {
 		log.Error("workload", "err", cmdErr)
 		os.Exit(1)
 	}
-}
-
-// acceptListenerFd accepts one connection and reads the SCM_RIGHTS listener fd.
-// The returned conn is kept open so the caller can ack the launcher.
-func acceptListenerFd(ln net.Listener) (int, net.Conn, error) {
-	conn, err := ln.Accept()
-	if err != nil {
-		return 0, nil, fmt.Errorf("accept: %w", err)
-	}
-	uc, ok := conn.(*net.UnixConn)
-	if !ok {
-		conn.Close()
-		return 0, nil, fmt.Errorf("not a unix conn")
-	}
-	buf := make([]byte, 1)
-	oob := make([]byte, unix.CmsgSpace(4))
-	_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
-	if err != nil {
-		conn.Close()
-		return 0, nil, fmt.Errorf("read msg: %w", err)
-	}
-	scms, err := unix.ParseSocketControlMessage(oob[:oobn])
-	if err != nil || len(scms) == 0 {
-		conn.Close()
-		return 0, nil, fmt.Errorf("parse control message: %w", err)
-	}
-	fds, err := unix.ParseUnixRights(&scms[0])
-	if err != nil || len(fds) == 0 {
-		conn.Close()
-		return 0, nil, fmt.Errorf("parse rights: %w", err)
-	}
-	return fds[0], conn, nil
 }
 
 // chunkstoreAdapter exposes the client chunkstore as a desync.Store so the

@@ -71,6 +71,11 @@ seccomp-validate: ## build a Linux image and run the seccomp interception valida
 	docker build -t mirage-validate -f Dockerfile .
 	docker run --rm mirage-validate bash scripts/seccomp-validate.sh
 
+.PHONY: seccomp-server-validate
+seccomp-server-validate: ## the production path: real mirage-server --seccomp driven by mirage-client over gRPC + health endpoint — UNPRIVILEGED (needs Docker)
+	docker build -t mirage-validate -f Dockerfile .
+	docker run --rm mirage-validate bash scripts/seccomp-server-validate.sh
+
 .PHONY: vet
 vet: ## go vet
 	go vet ./...

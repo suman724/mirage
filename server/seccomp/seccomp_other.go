@@ -8,6 +8,7 @@ package seccomp
 import (
 	"errors"
 	"log/slog"
+	"net"
 )
 
 // ErrUnsupported is returned by all operations on non-Linux platforms.
@@ -43,3 +44,6 @@ func (s *Supervisor) Stats() Stats { return Stats{} }
 
 // FdFromEnv is unsupported off Linux.
 func FdFromEnv(_ string) (int, bool) { return 0, false }
+
+// RecvListenerFd is unsupported off Linux.
+func RecvListenerFd(_ net.Listener) (int, net.Conn, error) { return 0, nil, ErrUnsupported }

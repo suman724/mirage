@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +35,41 @@ import (
 
 	"github.com/suman724/mirage/internal/logging"
 )
+
+// RecvListenerFd accepts one connection on ln and reads the seccomp listener
+// fd the launcher passes via SCM_RIGHTS (shim/launcher.c). The returned conn is
+// kept OPEN so the caller can acknowledge the launcher — the launcher waits for
+// that ack before it execs the workload, ensuring the supervisor is servicing
+// before any workspace open can trap.
+func RecvListenerFd(ln net.Listener) (int, net.Conn, error) {
+	conn, err := ln.Accept()
+	if err != nil {
+		return 0, nil, fmt.Errorf("seccomp: accept launcher: %w", err)
+	}
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		conn.Close()
+		return 0, nil, fmt.Errorf("seccomp: launcher connection is not a unix socket")
+	}
+	buf := make([]byte, 1)
+	oob := make([]byte, unix.CmsgSpace(4))
+	_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
+	if err != nil {
+		conn.Close()
+		return 0, nil, fmt.Errorf("seccomp: read listener fd: %w", err)
+	}
+	scms, err := unix.ParseSocketControlMessage(oob[:oobn])
+	if err != nil || len(scms) == 0 {
+		conn.Close()
+		return 0, nil, fmt.Errorf("seccomp: parse control message: %w", err)
+	}
+	fds, err := unix.ParseUnixRights(&scms[0])
+	if err != nil || len(fds) == 0 {
+		conn.Close()
+		return 0, nil, fmt.Errorf("seccomp: no listener fd in control message: %w", err)
+	}
+	return fds[0], conn, nil
+}
 
 // seccomp notification ioctls on the listener fd. x/sys/unix exports the
 // SECCOMP_* flags but not these ioctl request numbers, so they are fixed here
