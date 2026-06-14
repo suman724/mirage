@@ -1,271 +1,217 @@
-# Mirage on Fargate — Productionization & Scaling Handoff
+# Mirage on Fargate — Productionization Handoff
 
-**Purpose.** Mirage's FUSE-free lazy workspace ("Shimmer," via seccomp) is
-**proven on real ECS Fargate**. This document is the engineering hand-off for
-taking it from "validated prototype" to a **production, multi-tenant, scalable
-service** — and for building the **write-back** half (sandbox edits → laptop)
-that is designed but not yet implemented.
+**Purpose.** Mirage's FUSE-free lazy workspace (via Linux **seccomp**) is proven
+on real ECS Fargate. This document is the engineering hand-off to take it from
+*validated prototype* to *production*. It is self-contained: everything you need
+to understand the work is here.
 
-**Who this is for.** An engineering team picking up the codebase. It assumes you
-will read, in this order: [`docs/how-mirage-works.md`](./how-mirage-works.md)
-(the system from scratch), [`docs/how-shimmer-works.md`](./how-shimmer-works.md)
-(the seccomp path), and [`docs/design-shimmer.md`](./design-shimmer.md) (the
-build spec). This doc is the *work inventory + scaling architecture* on top of
-those.
+**Deployment model (fixed assumption for this whole document):** **one session =
+one ECS task = one client connection.** A task runs one `mirage-server`, projects
+one workspace, serves one laptop client, and runs one workload (the agent). There
+is no multi-tenancy inside a task. (How sessions are provisioned/placed across
+tasks is a separate concern, out of scope here.)
 
-**Status legend:** ✅ done & validated · 🟡 partial · ⬜ not started.
-**Priority:** P0 (blocks production) · P1 (needed to scale / for the headline
-use case) · P2 (important, not blocking) · P3 (optimization).
-**Effort:** S (≤2d) · M (~1wk) · L (2–4wk) · XL (>1mo / needs its own design).
+Status: ✅ done · 🟡 partial · ⬜ not started.
+Priority: P0 (blocks production) · P1 (core/correctness) · P2 (important) ·
+P3 (optimization). Effort: S (≤2d) · M (~1wk) · L (2–4wk) · XL (needs its own design).
 
 ---
 
-## 1. Where we are today (what's actually done)
+## 1. How it works today (enough to act on)
 
-**The core data path and both lazy-workspace mechanisms work and are tested.**
+The laptop runs **mirage-client**; the ECS task runs **mirage-server**. The
+client splits the workspace into content-hashed **chunks**, sends a tiny
+**manifest** (file → chunk-hash list), and the server fetches chunk *contents*
+lazily over **one gRPC stream the client dialed** (the server never dials back;
+it sends requests *down* the open stream). Secrets are excluded on the client at
+index time — the server can only ever request hashes the client published.
 
-- **Content-addressed transfer:** client chunks a workspace (content-defined
-  chunking via `desync`), publishes a tiny manifest, and the server faults chunk
-  *contents* lazily over **one client-dialed gRPC stream** (the server never
-  dials in). Dedup + on-disk cache + single-flight all reused from desync.
-  Secrets are excluded at index time on the client (security boundary).
-- **Four server modes**, all validated: `--out` (reconstruct), `--mount` (FUSE
-  lazy read), `--shim` (LD_PRELOAD fallback), and **`--seccomp` (the production
-  Shimmer mode)**.
-- **Seccomp interception (the headline):** `mirage-server --seccomp <dir> --
-  <workload>` runs as the container entrypoint (PID 1), builds a sparse-placeholder
-  skeleton on publish, launches the workload under a tiny C launcher that
-  installs a seccomp user-notification filter, and materializes each file the
-  workload `open()`s — covering **every** binary (libc, Go, static) at the
-  syscall layer. Reuses the same chunk store.
-- **Validated on real Fargate:** laptop client → **ALB (gRPC target group, TLS)**
-  → **ECS Service Connect sidecar** (re-encrypted) → **mirage-server** (PID 1,
-  plaintext gRPC intra-task) → launcher → workload; files transfer end-to-end.
-  Locally reproduced UNPRIVILEGED via `make seccomp-server-validate`.
-- **Health checks:** gRPC `grpc.health.v1` (SERVING) + optional HTTP
-  `--health-addr /healthz`.
+In the production **seccomp** mode, on connect the server:
+1. builds a **skeleton** — a real directory of sparse placeholder files (true
+   size/mode, zero content) so `ls`/`find`/`stat` work natively;
+2. launches the **workload** under a tiny C **launcher** that installs a seccomp
+   user-notification filter trapping `open()`;
+3. acts as the **supervisor**: when the workload opens a workspace file, the
+   kernel pauses it and notifies the server, which materializes that file (fetches
+   its chunks from the client into the placeholder) and lets the open proceed.
 
-**The transfer is one-way today: laptop → sandbox.** Edits made in the sandbox
-workspace do **not** flow back to the laptop. That is the single biggest
-functional gap (§3).
-
-### The deployment topology that was validated
+This catches **every** binary — libc, Go, static — because it intercepts at the
+syscall layer. It is lazy at the **file** level (whole file on first open; we
+can't intercept a real fd's reads or `mmap` page-faults).
 
 ```
-  laptop                          AWS
- ┌────────┐   TLS    ┌─────┐  TLS   ┌──────────────── ECS Fargate task ────────────────┐
- │ mirage │ ───────► │ ALB │ ─────► │ Service Connect ─plaintext─► mirage-server (PID 1)│
- │ client │ ◄─ gRPC ─┤(gRPC│ ◄───── │ sidecar proxy       gRPC     │  builds skeleton    │
- └────────┘  stream  │ TG) │        │                              │  seccomp supervisor │
-  has the files      └─────┘        │                              └──► launcher ──► WORKLOAD (agent)
-                                    └───────────────────────────────────────────────────┘
-                                                                         opens files → traps → materialize
+  laptop                    AWS                          ECS Fargate task
+ ┌────────┐  gRPC stream  ┌─────┐                ┌──── mirage-server (PID 1) ────┐
+ │ mirage │ ────────────► │ ALB │ ──► (sidecar)► │  gRPC + seccomp supervisor +  │
+ │ client │ ◄── chunks ── │     │ ◄──────────────│  skeleton builder             │
+ └────────┘   (server     └─────┘                │        │ launches              │
+  has files    requests                          │        ▼                      │
+               down the                          │  launcher ─► WORKLOAD (agent) │
+               stream)                           │            opens file → trap ─┘
 ```
 
-This works for **one** session per task. Multi-tenant scaling (§6) is a
-control-plane + routing problem on top of this.
+**mirage-server must run as the container entrypoint (PID 1)** so it is an
+*ancestor* of the workload — required to read the trapped process's memory
+(`ptrace_scope=1`) to learn which path it opened.
+
+**Today the transfer is one-way (laptop → sandbox).** Sandbox edits do not flow
+back to the laptop (§4). And a dropped connection destroys the session (§3) —
+the two biggest gaps.
 
 ---
 
-## 2. Finish the seccomp interception (make the mechanism production-correct)
+## 2. Finish the seccomp mechanism
 
-The mechanism is proven, but the current response strategy and lifecycle are the
-"simplest correct" versions. These items harden it. (Tracked in **issue #3**.)
-
-| # | Item | Pri | Eff | What & why | Where |
-|---|---|---|---|---|---|
-| 2.1 | **ADDFD response hardening** | P1 | M | Today the supervisor replies `CONTINUE` (kernel re-runs the tool's `open`). That has a TOCTOU window: a *malicious* workload could swap the path between our check and the kernel's re-read. Correct for trusted agents; unsafe for untrusted code. Fix: open the file in the supervisor and inject the fd via `SECCOMP_IOCTL_NOTIF_ADDFD` (atomic `ADDFD_FLAG_SEND`, available on Fargate's 6.1 kernel) — no re-execution, no race. Must match the tool's original open flags. | `server/seccomp/seccomp_linux.go` |
-| 2.2 | **PID-1 subreaper (zombie reaping)** | P1 | S | When mirage-server runs as PID 1, orphaned descendants (tools the workload spawned and abandoned) reparent onto it and become zombies unless reaped. Add a `SIGCHLD`/`wait` loop (or use a known subreaper pattern). | `server/main.go` / new |
-| 2.3 | **Per-open performance: measure & tune** | P1 | M | *Every* `open` in the sandbox traps and blocks while the supervisor decides — including the hundreds of `/usr/lib` opens at process start. The non-workspace fast-path must be cheap; the worker pool sizing matters. Measure real workloads (`go build`, `npm install`, `pytest`) and tune. This is the main unquantified risk of the whole approach. | `server/seccomp` |
-| 2.4 | **Concurrency correctness under load** | P1 | M | Many processes trapping simultaneously; the single-receiver + worker-pool design needs a load test (hundreds of concurrent opens) under the race detector and on Fargate. | `server/seccomp` + new test |
-| 2.5 | **Chunk-fetch failure resilience** | P1 | M | If a chunk fetch fails mid-materialization (network blip, client disconnect), the open currently fails with `EIO`. Decide retry/backoff vs. fail-fast; a transient blip shouldn't corrupt a session. Relates to reconnect (§5). | `server/shim/materializer.go`, `server/channelstore` |
-| 2.6 | **Workload lifecycle model** | P1 | L | Today the workload is launched **per client connection** (`serveSeccomp` per `Connect`). For a long-lived agent that should outlive a reconnect, this is wrong — a dropped connection kills the agent. Decide: persistent workload + reconnectable client, vs. session==connection. Big design choice; affects §5 and §6. | `server/transport/transport.go` |
-| 2.7 | **arm64 / Graviton validation on Fargate** | P2 | S | Proven on x86_64 Fargate; arm64 only proven locally. Re-run on Graviton Fargate (cheaper). Mechanism is arch-independent; low risk. | n/a |
-| 2.8 | **mmap / dlopen edge cases** | P2 | S | Whole-file materialize-on-open should make `mmap` and dynamic loading correct (real file backs the mapping), but explicitly test git packfiles, `ripgrep`, and a `dlopen`-heavy program. | new test |
-
-**Note on laziness:** seccomp is lazy at the **file** level (whole file on first
-open), not the **chunk** level — because once we hand a real fd to an outside
-process the kernel serves its reads and `mmap` page-faults, which we can't
-intercept. Per-chunk laziness survives only for in-process Go readers (§4, the
-billy adapter). This is intrinsic to syscall-level interception, not a bug.
-
----
-
-## 3. Write-back: sandbox edits → laptop (the missing half)
-
-**This is designed but not built.** The wire protocol already defines
-`WriteBackBatch`, `FileChange`, `WriteBackResult`, `FileApply`,
-`PermissionRequest`, `PermissionResult` (see `proto/mirage/v1/mirage.proto`) —
-**but there are zero Go handlers for them.** It needs its own design doc before
-code. (Tracked in **#16**, foundation in **#21**.)
-
-| # | Item | Pri | Eff | What & why | Where |
-|---|---|---|---|---|---|
-| 3.1 | **Namespace-syscall interception** (#21) | P1 | M | `open()`-only interception sees content writes but **not** tree-shape changes: `rename`, `unlink`, `rmdir`, `mkdir`, `link`, `symlink`, `chmod/chown`, `utimensat`. So the supervisor's `local` set — the exact set write-back must ship — is only a **lower bound**. Add these syscalls to the seccomp filter (cheap now — just more BPF entries + handlers updating the state table). **OR** a sync-time rescan (walk the workspace, diff vs manifest by size/mtime/hash) as a backstop. Acceptance: atomic-save, `rm`, `mkdir`, `chmod +x` all reflected. | `shim/launcher.c` (BPF), `server/seccomp`, `server/shim` (state table) |
-| 3.2 | **Write-back design doc** | P1 | M | Before code: conflict model (the `base_hash` field), permission/confirmation UX, secret round-trip prevention, reverse chunk transfer, partial-failure semantics. | new `docs/design-writeback.md` |
-| 3.3 | **Reverse chunk transfer** | P1 | L | New/modified file content must travel server→client as chunks (`new_chunk_hashes` + `inline_chunks` in `FileChange`). The server chunks the changed file; the client either has the chunks (dedup) or the server inlines them. Mirror of the existing client→server path. | `server/transport`, `client/transport` |
-| 3.4 | **Conflict detection** | P1 | M | `FileChange.base_hash` = the content hash at publish time. On apply, the client checks the laptop file still matches base_hash; if not, it's a conflict (user edited it meanwhile) → prompt, don't clobber. | `client/` apply path |
-| 3.5 | **Client-side apply + permission prompt** | P1 | M | Apply changes to the laptop workspace, **confined to the workspace root** (reject traversal), with a user confirmation (`PermissionRequest`/`Result`). | `client/` |
-| 3.6 | **Secret round-trip prevention** | P0-for-3 | S | A secret *created/edited* in the sandbox must not be written back to the laptop silently (the exclusion boundary is one-way today). Decide policy. | `client/index` policy + apply |
-
-**Sequencing:** 3.1 (or the rescan) is the foundation — write-back can't ship a
-correct change set without it. Then 3.2 design, then 3.3–3.6.
-
----
-
-## 4. Security (do before any untrusted exposure)
-
-| # | Item | Pri | Eff | What & why | Where |
-|---|---|---|---|---|---|
-| 4.1 | **Authentication** (#13) | **P0** | M | **There is none today.** `Hello.session_token` exists but is never validated — anyone who can reach the ALB can open a `Connect` stream, publish a workspace, and pull/serve chunks. Enforce identity at Hello/HelloAck: session tokens, mTLS identities, or per-session pairing codes. The token also becomes the routing key for scaling (§6). | `server/transport` Hello handler, `client/transport` |
-| 4.2 | **Authorization / session pairing** | **P0** | M | Bind a specific laptop ↔ a specific sandbox session, so client A can't attach to client B's sandbox. Ties to the control plane (§6). | control plane + transport |
-| 4.3 | **Workload is untrusted code — contain it** | P1 | M | If the sandbox runs arbitrary agent/user code, review: can it reach the launcher hand-off socket and forge requests? Can it escape `/workspace`? Can it read another tenant's data? (One task per tenant is the simplest isolation — §6.) ADDFD (2.1) is part of this. | review + `server/seccomp` |
-| 4.4 | **TLS on the transport** (#12) | P2 | S | In the validated deploy, the ALB + Service Connect handle encryption-in-transit; mirage-server speaks plaintext gRPC intra-task. Native TLS is only needed for deployments **without** an encrypting proxy. Keep as opt-in. | `server/main.go`, `client/transport` |
-
----
-
-## 5. Transport & connection robustness
-
-| # | Item | Pri | Eff | What & why | Where |
-|---|---|---|---|---|---|
-| 5.1 | **Reconnect / resume** (part of #15) | P1 | L | A dropped gRPC stream ends the session today. For real use (laptop sleeps, network blips) the client must reconnect and resume without losing the workload (depends on 2.6). | transport both sides |
-| 5.2 | **Graceful shutdown of in-flight sessions** | P2 | S | SIGTERM → `GracefulStop` exists, but verify in-flight seccomp sessions drain cleanly: stop servicing, kill the workload group, flush state. (Process-group kill is in; confirm under load.) | `server/transport`, `server/main.go` |
-| 5.3 | **Backpressure / flow control** | P2 | M | Under a fault storm (e.g. `grep -r`), many ChunkRequests queue on one stream. Verify gRPC flow control + the worker pool don't OOM or starve. | `server/channelstore` |
-
----
-
-## 6. Scaling the service (multi-tenant architecture) — the big one
-
-Everything above makes **one** task correct. Running this as a **service for many
-users**, each with their own sandbox, is a distinct architecture problem the
-current code does **not** address. The current server is single-session
-(fixed `--seccomp` dir + workload; one workspace per process).
-
-**The central challenge: routing a client to *its* task.** An ALB target group
-*load-balances* across healthy tasks — but a client must reach the **specific
-task** running *its* workspace/session, not a random one. Load balancing is the
-wrong primitive for session affinity. You need:
+The mechanism works; these make it production-correct.
 
 | # | Item | Pri | Eff | What & why |
 |---|---|---|---|---|
-| 6.1 | **Control plane / session manager** | P1 | XL | A service that: creates an ECS task per session, tracks session→task mapping, assigns the client, and tears the task down on session end. This is new infrastructure. |
-| 6.2 | **Session-affine routing / relay** | P1 | XL | Route a client to its task by **session token** (4.1), not round-robin. Options: (a) a relay/gateway the client dials that proxies to the right task by token (see #14, originally framed as NAT traversal but it's the same broker); (b) per-task addressing via service discovery; (c) one listener per task (doesn't scale). The client-dials model means the *initial* connect must land on the right task. |
-| 6.3 | **Task lifecycle & warm pools** | P2 | L | Cold task start + skeleton build is session-start latency. Pre-warmed task pools (#17) cut it. Define idle timeout, max session length, cleanup. |
-| 6.4 | **Capacity & storage limits** | P1 | M | Fargate ephemeral storage is finite (20 GB default, up to 200 GB). Materialized files + the chunk cache consume it. A large workspace + `grep -r` (materializes everything) can exhaust it. Need cache eviction (§7) and per-task sizing. |
-| 6.5 | **Multi-tenancy isolation** | P1 | M | Simplest model: **one task per tenant/session** (hard isolation, no shared memory, matches the PID-1/seccomp design). If you ever co-locate sessions in one task, the security review (4.3) gets much harder. Recommend one-task-per-session. |
-| 6.6 | **Autoscaling & cost** | P2 | M | Scale tasks with active sessions; cost is per-task-second. Model it. |
-
-**Recommended scaling model (opinion):** one ECS task per active session
-(one workspace, one client, one agent), fronted by a **control plane** that
-provisions tasks and a **session-token-addressed gateway** that routes each
-client to its task. This keeps the validated single-session server unchanged and
-puts all multi-tenancy in the new control/routing layer.
+| 2.1 | **ADDFD response hardening** | P1 | M | The supervisor currently replies `CONTINUE` (kernel re-runs the workload's `open`). That leaves a time-of-check/time-of-use window: a *malicious* workload could swap the path between our check and the kernel's re-read. Fine for trusted agents, unsafe for untrusted code. Fix: open the file in the supervisor and inject the fd via `SECCOMP_IOCTL_NOTIF_ADDFD` (atomic; supported on the Fargate kernel) — no re-execution, no race. Must replicate the workload's open flags. |
+| 2.2 | **PID-1 subreaper** | P1 | S | As PID 1, the server must reap orphaned descendants (tools the workload spawned and abandoned) or they become zombies. Add a `SIGCHLD`/`wait` reaping loop. |
+| 2.3 | **Per-open performance: measure & tune** | P1 | M | *Every* `open` in the sandbox traps and blocks while the supervisor decides — including the hundreds of `/usr/lib` opens at process start. The non-workspace fast-path must be cheap; tune the worker-pool size. Measure real workloads (`go build`, `npm install`, `pytest`). This is the main unquantified risk of the approach. |
+| 2.4 | **Concurrency under load** | P1 | M | Many processes trapping at once. The single-receiver + worker-pool design needs a load test (hundreds of concurrent opens) under the race detector and on Fargate. |
+| 2.5 | **arm64 / Graviton on Fargate** | P2 | S | Proven on x86_64 Fargate; arm64 proven only locally. Re-run on Graviton (cheaper). Mechanism is arch-independent; low risk. |
 
 ---
 
-## 7. Operational / production readiness
+## 3. Disconnect & reconnect (HIGH PRIORITY)
 
-| # | Item | Pri | Eff | What & why | Where |
-|---|---|---|---|---|---|
-| 7.1 | **Bounded chunk cache** | P1 | M | `desync.NewLocalStore(..., StoreOptions{})` is **unbounded** — it grows on disk for the session's lifetime. Add an LRU/size cap or periodic eviction; critical given Fargate storage limits (6.4). | `server/transport` |
-| 7.2 | **State journal growth/compaction** | P2 | S | The append-only state journal grows per ENSURE/DIRTY. Bound or compact it for long sessions. | `server/shim/state.go` |
-| 7.3 | **Observability** | P1 | M | Add metrics: chunk fetches, cache hit rate, materialization latency, trap rate, per-open overhead, errors, active sessions. Export (Prometheus/OTel) + dashboards + alerts. Structured logging (slog) already exists. | new |
-| 7.4 | **Cold-start latency for big trees** | P2 | M | Skeleton build is O(files) syscalls; for a huge monorepo measure and optimize (parallelize, lazy subtrees). | `server/shim/skeleton.go` |
-| 7.5 | **Resource limits & OOM safety** | P2 | M | Bound supervisor memory under fault storms; set task CPU/mem; handle disk-full gracefully (not silent corruption). | server + task def |
+**Current behavior (verified in code) — a disconnect destroys the session:**
 
----
+- The gRPC stream is the session's only lifeline. If it drops (laptop sleeps,
+  network blip, client crash), the stream's context is cancelled.
+- The server reacts by **SIGKILLing the workload's whole process group, stopping
+  the supervisor, and returning.** The running agent and all its in-progress work
+  are lost.
+- Any chunk fetch in flight at the moment of disconnect fails; if the workload
+  was mid-`open`, it receives an **EIO** error.
+- There is **no resume.** A new connection is a brand-new session: it rebuilds
+  the skeleton and relaunches the workload from scratch. (If a persistent
+  `--seccomp-state` dir is configured, the *file* materialization state in the
+  journal survives, so already-materialized files aren't re-fetched — but the
+  workload process itself is gone.)
 
-## 8. Performance for real agent workloads (laziness wins)
-
-Seccomp is per-file lazy; a repo-wide `grep`/search materializes everything.
-These reduce that cost and are high-value for agent use. (Independent of the
-core; pick up after P0/P1.)
+For a laptop on real networks this is unacceptable: every sleep/blip kills the
+agent. Reconnect support is the work below.
 
 | # | Item | Pri | Eff | What & why |
 |---|---|---|---|---|
-| 8.1 | **Search index published with the manifest** (#19) | P2 | L | Client builds a trigram/ctags index and publishes it; server answers "grep the repo" / "find symbol" without faulting every chunk. **Likely the biggest agent-workload win.** |
-| 8.2 | **S4: manifest mtime + `--include-git`** (#4, #5) | P2 | M | Add `mtime` to the manifest + skeleton; opt-in `.git` indexing (config scrub, hooks excluded). Makes `git status` a metadata-only walk (no content faulted), and is a prerequisite for the git fast-path. |
-| 8.3 | **Git fast-path** (#18) | P3 | L | Answer `git status`/`diff` on the **client** (where the real `.git` lives), shipping results not data — avoids server-side content reads entirely. |
-| 8.4 | **Prefetch heuristics** (#17) | P3 | M | Readahead within a file, sibling warmup, background manifest-order fill. Must respect the hash-based protocol. |
-
-> **Dropped: the billy adapter (former S5 / #6).** It was designed to give
-> per-chunk-lazy git by having a Go agent call go-git over a Mirage
-> `billy.Filesystem`. Under seccomp that's obsolete: the **real `git` binary**
-> (and any tool the agent shells out to) is intercepted transparently — billy
-> only ever covered in-process Go code we wrote, never `git` subprocesses. Its
-> one residual benefit, per-chunk laziness for git, is better delivered by
-> **S4** (status → metadata-only) + the **git fast-path #18** (status/diff
-> computed client-side). So git needs no special server-side adapter.
+| 3.1 | **Decouple workload lifetime from the connection** | P0 | L | A client disconnect must **not** kill the workload. The supervisor + workload keep running; only chunk *service* pauses. This is the foundational change for everything else here. |
+| 3.2 | **Pause, don't fail, on disconnect** | P1 | M | While the client is gone, a workspace open needing an un-cached chunk should **block** (hold the seccomp notification — the kernel keeps the process parked) up to a reconnect deadline, instead of returning EIO. Cached/already-materialized reads keep working offline. Today the per-fetch timeout (30s) would fire and fail — it must be suspendable across a disconnect window. |
+| 3.3 | **Re-attach on reconnect** | P0 | L | On reconnect the client re-dials; the server binds the **new** stream to the **existing** supervisor/workload and resumes serving the blocked/queued faults — rather than starting a fresh session. Needs a stable **session identity** (a token the client presents — ties to auth, §5) so the reconnecting client re-attaches to *its* session. |
+| 3.4 | **Resume, don't re-publish from scratch** | P1 | M | The manifest is session-frozen and the state journal already records what's materialized. Reconnect should reuse both (no skeleton rebuild, no re-fetch of materialized files). |
+| 3.5 | **Reconnect deadline + cleanup** | P1 | S | If the client doesn't return within a timeout, tear the session down (kill the workload group, free the cache/skeleton). Make the timeout configurable. |
+| 3.6 | **Enforce a single active connection per task** | P1 | M | **Bug today:** nothing stops a second concurrent client from opening a second `Connect`, which would spawn a second launcher + skeleton over the *same* directory → corruption. The server must allow only one active session: a reconnect *replaces* the prior stream; a genuinely concurrent second client is rejected. |
 
 ---
 
-## 9. Suggested sequencing
+## 4. Write-back: sandbox edits → laptop (the missing half)
 
-1. **P0 security before any shared/untrusted use:** 4.1 auth, 4.2 session pairing
-   (these also unlock §6 routing).
-2. **Harden the mechanism:** 2.2 subreaper, 2.1 ADDFD, 2.3 perf measurement,
-   2.5 fetch resilience, 2.6 workload lifecycle decision.
-3. **Write-back** (the missing half, high product value): 3.1 namespace syscalls,
-   3.2 design, then 3.3–3.6.
-4. **Scaling architecture in parallel:** 6.1 control plane + 6.2 routing,
-   6.4/7.1 storage+cache bounding, 7.3 observability.
-5. **Robustness:** 5.1 reconnect (with 2.6), 5.2/5.3.
-6. **Laziness wins:** 8.2 → 8.1 → 8.3, then 8.4/8.5.
+Designed but **not built**: the wire protocol defines the messages
+(`WriteBackBatch`, `FileChange`, `WriteBackResult`, `FileApply`,
+`PermissionRequest`, `PermissionResult`) but there are **zero handlers**. Needs
+its own design doc before code.
+
+| # | Item | Pri | Eff | What & why |
+|---|---|---|---|---|
+| 4.1 | **Track tree-shape changes (namespace syscalls)** | P1 | M | `open()`-only interception sees content writes but **not** `rename`/`unlink`/`rmdir`/`mkdir`/`link`/`symlink`/`chmod`/`chown`. So the supervisor's set of "changed files" is only a *lower bound* — exactly the set write-back must ship, so it has to be complete. Add these syscalls to the seccomp filter (cheap — more BPF entries + handlers), **or** do a sync-time rescan (walk the workspace, diff vs the manifest by size/mtime/hash) as a backstop. Acceptance: atomic-save, `rm`, `mkdir`, `chmod +x` are all reflected. |
+| 4.2 | **Write-back design doc** | P1 | M | Decide: conflict model, permission UX, secret round-trip policy, reverse chunk transfer, partial-failure semantics. |
+| 4.3 | **Reverse chunk transfer** | P1 | L | New/changed content travels server→client as chunks (mirror of the existing client→server path; the protocol already has the fields). |
+| 4.4 | **Conflict detection** | P1 | M | Each change carries the content hash it was based on; on apply the client checks the laptop file still matches, else flags a conflict (don't clobber). |
+| 4.5 | **Client-side apply + permission prompt** | P1 | M | Apply to the laptop, confined to the workspace root (reject traversal), with user confirmation. |
+| 4.6 | **Secret round-trip prevention** | P1 | S | A secret created/edited in the sandbox must not be written back to the laptop silently. |
+
+Sequence: 4.1 (foundation) → 4.2 design → 4.3–4.6.
 
 ---
 
-## 10. Pointers (code, build, validate)
+## 5. Security
 
-**Code map** (full version in `CLAUDE.md`):
-- `proto/mirage/v1/mirage.proto` — wire protocol (incl. the unimplemented
-  write-back/permission messages). `make proto` regenerates.
-- `internal/chunk` — chunking, manifest, the `Store` seam.
-- `client/index`, `client/chunkstore`, `client/transport` — the laptop side
-  (the only dialer; secret exclusion).
-- `server/transport` — accepts the stream, drives the four modes
-  (`serveSeccomp` is the production one).
-- `server/seccomp` — the seccomp notification loop (Linux).
-- `shim/launcher.c` — the C seccomp launcher. `shim/mirageshim.c` — the
-  LD_PRELOAD fallback.
-- `server/shim` — skeleton, state table+journal, the shared `Materializer`.
-- `server/channelstore` — the custom store that fetches over the gRPC stream.
-- `server/main.go` — entrypoint, flags, health endpoints.
+| # | Item | Pri | Eff | What & why |
+|---|---|---|---|---|
+| 5.1 | **Authentication** | **P0** | M | **There is none today.** The `Hello` handshake carries a session-token field that is never checked — anyone who can reach the server can open a stream, publish a workspace, and pull/serve chunks. Enforce identity at Hello (session tokens / mTLS / pairing codes). The same token is the session identity reconnect needs (§3.3). |
+| 5.2 | **Contain the untrusted workload** | P1 | M | If the sandbox runs arbitrary code, review: can it reach the launcher's hand-off socket and forge requests? Escape `/workspace`? ADDFD (2.1) is part of this. (One session per task already gives hard process isolation.) |
+| 5.3 | **TLS on the transport** | P2 | S | In the validated deployment, encryption-in-transit is handled in front of the server (ALB + sidecar); the server speaks plaintext gRPC inside the task. Native TLS is only needed for a deployment without an encrypting proxy. Keep opt-in. |
 
-**Build & validate:**
+---
+
+## 6. Operational readiness
+
+| # | Item | Pri | Eff | What & why |
+|---|---|---|---|---|
+| 6.1 | **Bound the chunk cache** | P1 | M | The on-disk chunk cache is **unbounded** — it grows for the session's lifetime. With Fargate's finite ephemeral storage, a large workspace + a repo-wide read (which materializes everything) can fill the disk. Add an LRU/size cap or eviction. |
+| 6.2 | **Bound/compact the state journal** | P2 | S | The append-only state journal grows per materialization/dirty event. Cap or compact it for long sessions. |
+| 6.3 | **Observability** | P1 | M | Metrics: chunk fetches, cache hit rate, materialization latency, trap rate, per-open overhead, errors, session state. Export + dashboards + alerts. (Structured logging already exists.) |
+| 6.4 | **Graceful shutdown** | P2 | S | SIGTERM already triggers graceful gRPC stop; verify an in-flight session drains cleanly (stop servicing, kill the workload group, flush state). |
+| 6.5 | **Cold-start latency for big trees** | P2 | M | Skeleton build is O(files) syscalls; measure/optimize for a large monorepo. |
+| 6.6 | **Disk-full / OOM safety** | P2 | M | Handle disk-full and memory pressure gracefully (clear error, not silent corruption). |
+
+---
+
+## 7. Laziness wins (for real agent workloads)
+
+seccomp is per-file lazy, so a repo-wide search materializes everything. These
+cut that cost. Independent of the above; pick up after P0/P1.
+
+| # | Item | Pri | Eff | What & why |
+|---|---|---|---|---|
+| 7.1 | **Search index published with the manifest** | P2 | L | Client builds a trigram/symbol index and publishes it; server answers "grep the repo" / "find symbol" without faulting every chunk. Likely the biggest agent-workload win. |
+| 7.2 | **Manifest mtime + opt-in `.git` indexing** | P2 | M | Add `mtime` to the manifest + skeleton, and let the client publish a scrubbed `.git`. Makes `git status` a metadata-only walk (no content faulted). Prerequisite for the git fast-path. |
+| 7.3 | **Git fast-path** | P3 | L | Answer `git status`/`diff` on the **client** (where the real `.git` lives), shipping results not data — avoids server-side content reads entirely. (Note: the former "in-process go-git/billy adapter" idea is dropped — seccomp runs the real `git` binary transparently; lazy git comes from 7.2 + this.) |
+| 7.4 | **Prefetch heuristics** | P3 | M | Readahead within a file, sibling warmup, background fill. Must respect the hash-based protocol (only published hashes). |
+
+---
+
+## 8. Suggested sequencing
+
+1. **P0 before any untrusted/shared use:** 5.1 auth (also the session identity for reconnect).
+2. **Survive real networks:** §3 disconnect/reconnect — 3.1 + 3.3 (decouple + re-attach), then 3.2/3.4/3.5/3.6.
+3. **Harden the mechanism:** 2.2 subreaper, 2.1 ADDFD, 2.3 perf, 2.4 concurrency.
+4. **Write-back** (the missing half): 4.1 → 4.2 → 4.3–4.6.
+5. **Operational:** 6.1 cache bound, 6.3 observability, the rest of §6.
+6. **Laziness wins:** 7.2 → 7.1 → 7.3/7.4.
+
+---
+
+## 9. The codebase (self-contained map)
+
+| Area | Path | Role |
+|---|---|---|
+| Wire protocol | `proto/mirage/v1/mirage.proto` | Source of truth (incl. the unimplemented write-back/permission messages). `make proto` regenerates the Go. |
+| Chunking | `internal/chunk` | Content-defined chunking, manifest, the `Store` seam. |
+| Client | `client/index`, `client/chunkstore`, `client/transport` | Walks the dir, excludes secrets, the **only** dialer; serves chunk requests by hash. |
+| Server transport | `server/transport` | Accepts the stream; drives the modes. `serveSeccomp` is the production one; `Connect` runs the recv loop. |
+| Seccomp supervisor | `server/seccomp` (Linux) | The notification loop: receive trap → read path from `/proc/<pid>/mem` → materialize → respond. |
+| Launcher | `shim/launcher.c` | C: installs the seccomp filter, hands the listener fd to the server, execs the workload. |
+| Skeleton + state | `server/shim` | Sparse-placeholder builder, per-path state table + journal, the shared `Materializer`. |
+| Channel store | `server/channelstore` | The `Store` that fetches a chunk by sending a request down the gRPC stream; 30s per-fetch timeout, cancels on disconnect. |
+| Entrypoint | `server/main.go` | Flags, mode selection, gRPC + HTTP health endpoints. |
+
+**Build & validate** (the seccomp validations run UNPRIVILEGED in Docker — the
+Fargate property — and need no devices/capabilities):
 ```bash
 make build                    # binaries
-make test / make test-race    # unit + integration (reconstruct path)
-make seccomp-server-validate  # the production path: server --seccomp <- client over gRPC + health (Docker, UNPRIVILEGED)
-make seccomp-validate         # the seccomp mechanism harness
-make shim-validate            # LD_PRELOAD fallback
-make fuse-validate            # FUSE mode (needs /dev/fuse + SYS_ADMIN)
+make test                     # unit + integration
+make seccomp-server-validate  # production path: server --seccomp <- client over gRPC + health
+make seccomp-validate         # the seccomp mechanism on its own
 ```
 
-**Run the production mode locally** (sketch):
+**Run the production mode** (deploy mirage-server as the container entrypoint / PID 1):
 ```bash
 mirage-server --addr :7777 --seccomp /workspace --seccomp-state /state \
   --seccomp-launcher /usr/local/bin/mirage-launcher --health-addr :8080 \
-  -- <your-agent-command>
-# then, from the laptop:
-mirage-client --addr <server-or-ALB-host> --dir /path/to/project
+  -- <agent-command>
+# laptop:
+mirage-client --addr <server-host> --dir /path/to/project
 ```
-Deploy `mirage-server` as the **container entrypoint (PID 1)**.
 
-**Key invariants to preserve (don't break these):**
-- The connection is **always** client→server. Only `client/transport` dials.
+**Invariants to preserve (do not break):**
+- The connection is **always** client→server; only the client dials.
 - The protocol is **chunk-hash based, not path based** — the server can only
   request hashes the client published; the client rejects others. This is the
   security boundary.
-- Secret exclusion happens at **index-build time on the client**.
-- The seccomp supervisor must be an **ancestor of the workload**
-  (`ptrace_scope=1`) — run mirage-server as PID 1.
-
-**Background reading:** `docs/how-mirage-works.md`,
-`docs/how-shimmer-works.md`, `docs/design-shimmer.md`,
-`docs/mirage-on-fargate.md` (why FUSE is out, options compared),
-`docs/workspace-fs-and-transport.md` (original full design), `HANDOFF.md`.
-
-**Issue tracker:** Shimmer #1–#10 (#3 = remaining seccomp items; #4/#5/#6 =
-S4/S5), #21 = namespace syscalls (write-back foundation); Horizon #11–#20
-(#13 auth, #15 connections, #16 write-back, #17 prefetch, #18 git fast-path,
-#19 search index). Tracking issues #10 and #20.
+- Secret exclusion happens at index time **on the client**.
+- The seccomp supervisor must be an **ancestor of the workload** — run
+  mirage-server as **PID 1**.
+- The workspace is lazy at the **file** level under seccomp; don't assume
+  per-chunk laziness for external tools.
