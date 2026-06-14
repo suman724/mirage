@@ -58,8 +58,13 @@ Goals:
 - G1. libc tools read `/workspace` lazily, **per-file** (materialize on
   first open), with native metadata (`ls`, `find`, `stat` need no
   interception).
-- G2. The embedded Go agent gets **per-chunk** lazy git via go-git over a
-  Mirage-backed `billy.Filesystem`.
+- ~~G2. The embedded Go agent gets **per-chunk** lazy git via go-git over a
+  Mirage-backed `billy.Filesystem`.~~ **DROPPED (2026-06-13) under the seccomp
+  pivot:** seccomp intercepts the real `git` binary (and any tool the agent
+  spawns) transparently, so git needs no in-process adapter. The residual goal
+  — git ops that don't fault the whole tree — is delivered by S4 (manifest
+  mtime → `git status` is metadata-only) and the git fast-path (#18,
+  status/diff computed client-side). See §7 (superseded).
 - G3. Correctness over laziness: no process ever observes wrong file
   *content*. Uninterceptable binaries are blocked or get a fully
   materialized tree.
@@ -114,8 +119,10 @@ One new server mode, `--shim DIR`, sits beside `--out` and `--mount` in
 `server/transport.drive()`. On `IndexPublish` it:
 
 1. builds the **skeleton** under DIR,
-2. starts the **supervisor** listening on a unix socket,
-3. optionally hands the embedding agent a `billy.Filesystem` / `fs.FS`.
+2. starts the **supervisor** listening on a unix socket.
+
+(The original step 3 — handing the agent a `billy.Filesystem`/`fs.FS` — is
+dropped; see §7. The production interception is `--seccomp`, §3.3.)
 
 ### 3.1 Skeleton
 
@@ -443,7 +450,17 @@ Without this flag, a server-side git client has no repo data; the
 alternative (clone from origin) loses uncommitted laptop state and defeats
 the mtime shortcut, so `--include-git` is the recommended path.
 
-## 7. Billy adapter (go-git integration)
+## 7. Billy adapter (go-git integration) — SUPERSEDED, NOT BUILDING
+
+> **DROPPED (2026-06-13).** This adapter only made sense under the original
+> assumption of a Go agent doing git in-process via go-git. The seccomp pivot
+> removes that assumption: the real `git` binary and every tool the agent
+> spawns are intercepted at the syscall layer and get materialized files
+> transparently — billy never covered `git` subprocesses anyway. The residual
+> goal (git ops without faulting the whole tree) is delivered by **S4**
+> (manifest mtime → `git status` is a metadata-only walk) and the **git
+> fast-path (#18)** (status/diff computed on the client). No `server/billyfs`
+> package will be built. The design below is retained as history.
 
 New package `server/billyfs`: implements `billy.Filesystem` for the
 embedding Go agent. Routing rule per call:
@@ -495,8 +512,10 @@ Extend the Docker harness (pattern: `make fuse-validate`) with
 - Go/static coverage (seccomp, §3.3): a **static Go binary** reading a
   workspace file gets correct content (the case the C shim could not cover) —
   this replaces the retired exec-gate test.
-- go-git: in-process `status` (clean + after `sed -i`), `log`, `diff` on
-  the fixture repo; status performs zero content reads when clean.
+- Git (no billy adapter): with S4 (manifest mtime + indexed `.git`), the real
+  `git status` runs metadata-only (zero content faults) under seccomp; `log`/
+  `diff` are answered by the git fast-path (#18) on the client. (The former
+  go-git/billy in-process test is dropped — §7.)
 - Finally on Fargate itself (manual or CI job): the same harness image as
   a one-shot task — proves G4 where it matters.
 
@@ -523,7 +542,8 @@ Extend the Docker harness (pattern: `make fuse-validate`) with
    a runtime forbids installing a seccomp filter).
 6. **S4 — mtime + .git**: manifest field, skeleton mtimes, `--include-git`
    with scrub. (Independent of the interception mechanism.)
-7. **S5 — billy adapter**: `server/billyfs`, go-git demo + laziness tests.
+7. ~~**S5 — billy adapter**~~ **DROPPED** (superseded by seccomp + S4 + git
+   fast-path #18; see §7). Git needs no in-process adapter.
 8. **S6 — Fargate validation**: full harness as a Fargate task; document.
 
 Reserved (foundation for write-back, issue #21): **namespace-syscall
@@ -531,7 +551,7 @@ interception** (rename/unlink/mkdir/chmod…) per §4.1 safeguard 2. Under secco
 (§3.3) this is just additional syscall numbers in the filter, not a new system.
 
 S1–S2 delivered standalone value (lazy libc tools); S3′ generalizes it to all
-binaries; S4–S5 deliver git.
+binaries; S4 + the git fast-path (#18) deliver lazy git (no billy adapter).
 
 ## 11. Open questions
 

@@ -184,10 +184,18 @@ core; pick up after P0/P1.)
 | # | Item | Pri | Eff | What & why |
 |---|---|---|---|---|
 | 8.1 | **Search index published with the manifest** (#19) | P2 | L | Client builds a trigram/ctags index and publishes it; server answers "grep the repo" / "find symbol" without faulting every chunk. **Likely the biggest agent-workload win.** |
-| 8.2 | **S4: manifest mtime + `--include-git`** (#4, #5) | P2 | M | Add `mtime` to the manifest + skeleton; opt-in `.git` indexing (config scrub, hooks excluded). Prerequisite so `git status` doesn't hash (and fault) the whole tree. |
-| 8.3 | **S5: billy adapter for in-process go-git** (#6) | P2 | L | A `billy.Filesystem` over the chunk store gives the agent **per-chunk-lazy** git in-process (recovering chunk-level laziness for git, which seccomp loses for external tools). |
+| 8.2 | **S4: manifest mtime + `--include-git`** (#4, #5) | P2 | M | Add `mtime` to the manifest + skeleton; opt-in `.git` indexing (config scrub, hooks excluded). Makes `git status` a metadata-only walk (no content faulted), and is a prerequisite for the git fast-path. |
+| 8.3 | **Git fast-path** (#18) | P3 | L | Answer `git status`/`diff` on the **client** (where the real `.git` lives), shipping results not data — avoids server-side content reads entirely. |
 | 8.4 | **Prefetch heuristics** (#17) | P3 | M | Readahead within a file, sibling warmup, background manifest-order fill. Must respect the hash-based protocol. |
-| 8.5 | **Git fast-path** (#18) | P3 | L | Answer `git status`/`diff` on the **client** (where the real `.git` lives), shipping results not data. |
+
+> **Dropped: the billy adapter (former S5 / #6).** It was designed to give
+> per-chunk-lazy git by having a Go agent call go-git over a Mirage
+> `billy.Filesystem`. Under seccomp that's obsolete: the **real `git` binary**
+> (and any tool the agent shells out to) is intercepted transparently — billy
+> only ever covered in-process Go code we wrote, never `git` subprocesses. Its
+> one residual benefit, per-chunk laziness for git, is better delivered by
+> **S4** (status → metadata-only) + the **git fast-path #18** (status/diff
+> computed client-side). So git needs no special server-side adapter.
 
 ---
 

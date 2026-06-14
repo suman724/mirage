@@ -117,7 +117,7 @@ Tracked as GitHub issues **#1–#10** (tracking issue #10); design in
 | S3 | ~~Exec gate~~ | ❌ RETIRED | Superseded by §3.3 — seccomp intercepts Go/static natively, nothing to gate. |
 | S3′ | **Seccomp supervisor (primary path)**: C launcher + Go notification loop, path resolution from registers, reuse `Ensure()`, **wired into `mirage-server --seccomp`** (PID 1 → launcher → workload) + gRPC/HTTP health endpoint | ✅ (core) | Validated UNPRIVILEGED (`make seccomp-server-validate`: real server+client over gRPC, libc + static Go binary) and on **real Fargate behind an ALB** (gRPC target group, TLS via Service Connect). Remaining: ADDFD hardening, per-trap latency, retire the C shim. |
 | S4 | Manifest mtime + `--include-git` (config scrub, hooks excluded) | ⬜ | Independent of the interception mechanism; prerequisite for lazy git status. |
-| S5 | Billy adapter (`server/billyfs`) for in-process go-git | ⬜ | |
+| ~~S5~~ | ~~Billy adapter (`server/billyfs`)~~ | ❌ DROPPED | Superseded by seccomp (runs real `git` transparently) + S4 + git fast-path (#18). No in-process git adapter needed. Issue #6 closed. |
 | S6 | Fargate validation (full harness as a one-shot task) | ⬜ | |
 
 ## Later iterations (NOT started — filed as [Horizon] issues #11–#20, tracking #20)

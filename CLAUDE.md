@@ -107,5 +107,7 @@ fast-path, search index ([Horizon] issues #11–#20). **Shimmer status:** S1
 Fargate), and **S3′ (seccomp wired into `mirage-server --seccomp`)** are DONE
 and validated — incl. on real Fargate behind an ALB. The exec gate is retired
 (seccomp covers Go/static). Remaining Shimmer: ADDFD hardening, per-trap perf,
-retire the C shim, then S4 (mtime + `--include-git`), S5 (billy/go-git).
+decide the C shim's fate, then S4 (mtime + `--include-git`). The billy adapter
+(former S5, #6) is **dropped** — seccomp runs real `git` transparently; lazy git
+comes from S4 + the git fast-path (#18).
 Namespace-syscall interception reserved as #21. Tracking: issue #10.
