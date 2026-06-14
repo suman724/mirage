@@ -83,6 +83,7 @@ events).
   the harness under the C launcher (a CLI-only subprocess).
 
 ### Connection, routing, auth
+*(Full design + task breakdown in §5 and §6 — this is the next build target.)*
 - **Custom Go data-plane proxy** (chosen over Envoy for stack fit + simple
   routing). Responsibilities: validate the session token, look up session→task,
   then **transparently splice the bidirectional stream** to the task's
@@ -155,3 +156,154 @@ events).
   chunk cache bound (it's unbounded today) and Fargate ephemeral storage.
 - **Scaling** (control-plane/session placement) — deliberately out of scope here;
   separate discussion.
+
+---
+
+## 5. The Go data-plane proxy (detailed design)
+
+The proxy is the **authenticated, session-affine ingress** for the Mirage gRPC
+stream. Path: `mirage-client → ALB → Go proxy (fleet) → mirage-server (task)`.
+Its entire job is: authenticate the session, route to the right task, and
+**transparently forward the long-lived bidirectional gRPC stream** — without
+ever understanding Mirage's messages.
+
+### 5.1 Responsibilities (and non-responsibilities)
+
+**Does:**
+- Terminate the inbound gRPC/HTTP-2 connection from the ALB.
+- Read the **session token** once, at stream open (from gRPC metadata).
+- **Authenticate** the token (gatekeeper; mirage-server re-validates independently).
+- Resolve **session → task address** (via the session service).
+- Dial the task's mirage-server and **splice the bidi stream** both ways until
+  either side closes — forwarding raw message frames, never deserializing them.
+- Pass **heartbeats through transparently** (they're end-to-end client↔server).
+- Export health + metrics; shut down gracefully (drain live streams).
+
+**Does NOT:**
+- Parse, inspect, or buffer chunk payloads (it moves bytes).
+- Hold session state beyond the live connection (it's **stateless**).
+- Make materialization, write-back, or reconnect decisions (those are
+  mirage-server's). On reconnect it simply re-resolves token→task again.
+- Terminate or generate heartbeats.
+
+### 5.2 Implementation approach (gRPC transparent proxy)
+
+Mirage exposes one bidi-streaming method (`Mirage.Connect`). The proxy forwards
+it without a generated stub using the standard Go transparent-proxy pattern:
+
+- A `grpc.Server` configured with:
+  - a **raw passthrough codec** (`grpc.ForceServerCodec`) whose Marshal/Unmarshal
+    pass `[]byte` frames through untouched — so the proxy never deserializes
+    Mirage messages; and
+  - an **`grpc.UnknownServiceHandler`** that handles *any* method (the proxy
+    registers no service) — this is the forwarder.
+- The forwarder:
+  1. pulls metadata from the incoming `ServerStream` context, extracts + validates
+     the token, resolves the backend address;
+  2. dials a `grpc.ClientConn` to the task (or reuses a pooled one) and opens a
+     client stream to the **same full method** with the raw codec;
+  3. runs **two goroutines** pumping frames concurrently — client→backend and
+     backend→client — via `RecvMsg(&raw)` / `SendMsg(&raw)`, propagating
+     headers, trailers, and final gRPC status;
+  4. tears both sides down when either ends.
+
+Reference: the `mwitkow/grpc-proxy` `StreamDirector`/`TransparentHandler`/`Codec`
+pattern. It predates current grpc-go APIs (codec is now `encoding.Codec` with
+`Name()`, and `ForceServerCodec` replaced the old registration), so **use the
+pattern, adapt to current grpc-go** — ~300 LOC if reimplemented.
+
+L7 (gRPC-aware) is chosen over L4 TCP splicing because we need to read the token
+from gRPC metadata and propagate gRPC status/trailers cleanly. The cost (HTTP-2
+framing) is negligible next to chunk throughput.
+
+### 5.3 Token, auth, and routing
+
+- **Where the token lives:** gRPC metadata header (e.g. `x-mirage-session` /
+  `authorization`), read from the opening stream's context. (mirage-client sets
+  it; it also flows in `Hello` so mirage-server can re-validate — §3 auth.)
+- **Auth at the proxy:** verify the token offline (signed token) or via the
+  session service; reject invalid/expired with `UNAUTHENTICATED` **before**
+  dialing any backend.
+- **Routing:** resolve token/session → **task address** (a Service Connect
+  endpoint or IP:port). The session service owns the session→task-ARN map, so it
+  must expose a **lookup that returns a routable address** for the session
+  (ARN alone isn't dialable). Resolve **per connection** (don't cache across the
+  connection's life — keeps reconnect correct and the proxy stateless); a short
+  TTL cache is OK. Lookup miss / task gone → `UNAVAILABLE`/`NOT_FOUND`.
+
+### 5.4 Long-lived stream handling
+
+- **Idle timeouts:** disable or set very generous timeouts on the proxied stream
+  (sessions last minutes–hours). Heartbeats (≤60s) keep it active; the proxy must
+  not kill a live long stream. Keep the proxy's own keepalive enforcement lenient
+  enough not to drop heartbeating clients (`grpc.KeepaliveEnforcementPolicy` /
+  `ServerParameters` tuned to the heartbeat interval).
+- **Bidirectional concurrency:** both directions flow independently (client→server:
+  Hello/IndexPublish/ChunkResponse/heartbeat/write-back-result; server→client:
+  HelloAck/ChunkRequest/write-back-batch/heartbeat). Pump them in separate
+  goroutines; don't serialize.
+- **Backpressure:** rely on gRPC/HTTP-2 flow control; don't add unbounded buffers.
+
+### 5.5 Failure & teardown
+
+- Token invalid/expired → `UNAUTHENTICATED`; routing miss → `UNAVAILABLE`;
+  backend dial fail → `UNAVAILABLE` — all before/without corrupting a session.
+- **Backend stream drops** mid-session → propagate the error/status to the client
+  so it knows to reconnect.
+- **Client drops** → close the backend stream; mirage-server then starts its
+  grace timer (§3 reconnect). The proxy keeps no state.
+- **Reconnect** is automatic: a fresh client stream re-resolves token→task to the
+  **same task**, possibly via a **different proxy instance** (statelessness makes
+  this fine).
+
+### 5.6 Statelessness & fleet
+
+The proxy holds nothing per-session beyond the live connection, so run it as a
+**horizontally-scaled fleet behind the ALB**. Any instance handles any session;
+a reconnect landing on a different instance still routes correctly. No SPOF,
+no sticky sessions required.
+
+### 5.7 TLS & network
+
+- Inbound: ALB terminates client TLS; ALB→proxy per your existing scheme.
+- Proxy→task: use the same model as today (Service Connect / mTLS, or plaintext
+  within the VPC gated by **security groups so only the proxy can reach a task's
+  mirage-server port**). The security-group lockdown is also what lets
+  mirage-server's auth be defense-in-depth rather than the sole gate.
+
+### 5.8 Config & observability
+
+- **Config:** listen addr; session-service endpoint (token validation + task
+  lookup); token verification key/secret; dial timeout; idle timeout (generous);
+  TLS material; keepalive params.
+- **Metrics:** active streams, bytes/sec per direction, dial latency, auth
+  failures, routing failures/misses, stream lifetimes. **Health:** HTTP/gRPC
+  endpoint for the ALB. **Logs:** structured, per-session (no payloads).
+
+---
+
+## 6. Go proxy — task breakdown
+
+Ordered; each is independently testable. Effort: S (≤2d) · M (~1wk).
+
+| # | Task | Eff | Done when |
+|---|---|---|---|
+| P1 | **Service skeleton** — gRPC server, config loading, health endpoint, structured logging, graceful shutdown scaffold. | S | Starts; health returns 200; accepts a gRPC connection; clean SIGTERM. |
+| P2 | **Transparent bidi forwarder (core)** — raw passthrough codec + `UnknownServiceHandler`; forward to a **hardcoded** backend; two-goroutine pump; propagate headers/trailers/status. | M | `mirage-client → proxy → mirage-server` works end-to-end against a static backend: chunks flow, heartbeats pass through, a real workspace materializes. The make-or-break milestone. |
+| P3 | **Token extraction + auth** — read the session token from metadata; verify (signed-token or session-service call); reject invalid/expired with `UNAUTHENTICATED` before dialing. | M | Bad/absent/expired token rejected; valid token proceeds. |
+| P4 | **Session→task resolution** — session-service lookup returning a routable task address; per-connection resolve + short-TTL cache; miss → `UNAVAILABLE`. | M | Token resolves to the correct task address; lookup failure surfaces cleanly. |
+| P5 | **Dynamic routing (wire P3+P4 into the director)** — the forwarder dials the resolved backend per connection. | S | Two concurrent sessions route to two different tasks correctly. |
+| P6 | **Long-lived stream robustness** — generous/disabled idle timeouts; keepalive tuned to the heartbeat interval; half-close; error propagation both ways; clean teardown. | M | A multi-minute idle-but-heartbeating stream stays up; backend drop propagates to the client; client drop closes the backend. |
+| P7 | **Reconnect routing** — confirm a fresh client stream re-resolves token→task to the **same** task, including via a **different proxy instance**. | S | Kill client mid-session, reconnect → routes to the same task (verified across two proxy instances). |
+| P8 | **Observability** — metrics (active streams, bytes/dir, dial latency, auth/route failures), per-session structured logs. | S | Metrics exported and scrapeable; dashboards possible. |
+| P9 | **TLS & network lockdown** — TLS on the hops per your model; security groups so only the proxy reaches task mirage-server ports. | M | Encrypted hops; direct task access from outside the proxy is blocked. |
+| P10 | **Load & soak** — many concurrent long-lived streams, sustained chunk throughput + heartbeats; measure overhead vs. a direct connection; check for leaks. | M | Target concurrency sustained; no fd/goroutine/memory leaks over a multi-hour soak; overhead acceptable. |
+
+**Suggested path:** P1 → **P2 (prove the splice first — biggest risk)** → P3/P4/P5
+(auth + routing) → P6/P7 (robustness + reconnect) → P8/P9/P10 (ops + hardening).
+
+**Dependencies on the rest of the system:** P3/P4 need the session service to
+expose **(a) token validation** (or a verification key) and **(b) a session→task
+*address* lookup**. P2 can proceed immediately against a local mirage-server.
+The proxy does **not** depend on write-back or the reconnect server-side work —
+it's a pure forwarder, so it can be built in parallel with those.
