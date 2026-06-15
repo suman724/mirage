@@ -1,7 +1,8 @@
 # Design — ptrace interception front-end
 
-**Status:** core mechanism **built and validated** (Docker/arm64); production
-server-mode wiring not yet done — see §13. Engineering spec for Mirage's
+**Status:** core mechanism **and the `--ptrace` side-attach server mode built
+and validated** (Docker/arm64); see §13. Remaining: amd64 runtime + gRPC-path
+e2e validation. Engineering spec for Mirage's
 **ptrace-based** interception front-end — the alternative to the seccomp
 user-notification front-end. Plain-language background:
 `how-ptrace-interception-works.md`. Tracking: GitHub milestone *"Ptrace
@@ -284,19 +285,29 @@ real parent, so the seize works without `CAP_SYS_PTRACE`; the cap is added to
 mirror production side-attach. **amd64 register/syscall decode compiles but is
 not yet runtime-validated** (local Docker is arm64) — run on an amd64 host/CI.
 
+**mirage-server `--ptrace` mode — built (side-attach).** Chosen over launcher
+mode because side-attach is the reason ptrace exists (mirage-server is NOT the
+workload's parent) and is structurally simpler (no child lifecycle, no
+double-reap workaround). `transport.NewPtrace` + `servePtrace`: on IndexPublish
+it builds the skeleton, then runs `Tracer.Serve(ctx, <state>/attach.sock)`. It
+launches no workload — the orchestrator (or, in validation, an independent
+trace-launcher process) connects and requests `ATTACH <pid>`, and the tracer
+seizes that *non-descendant* via `CAP_SYS_PTRACE`. `Tracer.Serve` now takes a
+context: on client disconnect it `PTRACE_INTERRUPT`s + `PTRACE_DETACH`es every
+tracee (leaving the workload running) and returns `context.Canceled`. We also
+dropped `PTRACE_O_EXITKILL` so a tracer crash auto-detaches rather than killing
+the orchestrator's tree. Flags: `--ptrace DIR` / `--ptrace-state DIR` (mutually
+exclusive with `--mount`/`--shim`/`--seccomp`). Validated by HEADLINE 3 in
+`ptrace-validate.sh` (side-attach to a non-descendant, `errors=0`).
+
 **Not yet built:**
 
-- **mirage-server `--ptrace` mode** (wiring into `server/transport` + `main.go`,
-  symmetric to `--seccomp`). This forks on a CLI-integration decision still open:
-  *launcher mode* (mirage-server spawns the trace-launcher as its child, like
-  `serveSeccomp`) vs *side-attach mode* (the orchestrator owns the workload and
-  calls `mirage_trace.enable()`; mirage-server only runs `Tracer.Serve` on the
-  attach socket and attaches a non-descendant via `CAP_SYS_PTRACE`). Side-attach
-  is the reason ptrace was chosen and is structurally simpler (no child
-  management), but its gRPC-path validation needs a stand-in attacher. Decide
-  alongside the CLI integration (cli-integration-design.md §3).
-- `Tracer.Serve` taking a `context.Context` for teardown on client disconnect
-  (reconnect/detach semantics, §11; CLI issue #33).
+- amd64 **runtime** validation (local Docker is arm64; amd64 only compiles).
+- The `--ptrace` mode's **gRPC-path** end-to-end validation (real mirage-server
+  `--ptrace` + mirage-client + an external attacher), analogous to
+  `seccomp-server-validate.sh`. The mechanism is validated without gRPC today.
+- Reconnect/resume after a disconnect-then-reattach (detach side is done; the
+  re-attach + grace-window policy is CLI issue #33).
 - The `mirage_trace` Python package (design §4.1) as a real repo artifact.
 - Coexistence test with a real second seccomp `NEW_LISTENER` holder (§10).
 - Overhead measurement on a real agent run (the gating §9 number).
