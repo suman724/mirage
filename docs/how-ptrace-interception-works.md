@@ -99,6 +99,35 @@ listener conflict.
 
 ---
 
+## 5a. Who does what (the part people get confused about)
+
+**mirage-server does essentially everything.** It runs as its own process (with
+`CAP_SYS_PTRACE`), attaches to the workload, and on every `open`/`exec` reads the
+path, fetches+fills the file if it's a workspace file, and resumes the program.
+All the interception logic lives here.
+
+**The orchestrator does exactly one tiny thing** (in the chosen "accelerated"
+setup): at the start of a session it installs a small seccomp filter on itself
+that means *"kernel, when I or my children open or exec a file, notify my
+tracer."* That's the whole job — no path checks, no fetching, no logic. Think of
+it as installing the **doorbell wiring** so the kernel rings mirage only on
+opens/execs (which is what keeps it fast); mirage answers the doorbell and does
+the work.
+
+*Why can't mirage install that filter itself?* A seccomp filter can only be put
+in place by the process it applies to (on itself). mirage attaches from the
+side — it isn't the orchestrator's parent — so it can't install the filter into
+the orchestrator. The orchestrator installs it; mirage does everything after.
+
+**How the orchestrator (which is Python) installs it without touching seccomp:**
+Mirage ships a small package it just calls once — `mirage_trace.enable(...)` —
+when a session starts. That call coordinates with mirage (attach first) and
+installs the filter; all the seccomp/BPF detail is inside Mirage's code. One
+import, one call. (It must be called only when mirage will attach — i.e. on the
+real-workspace/CLI path — because the filter without a tracer would make file
+opens fail; that's why it's a call at session start, not baked into container
+startup.)
+
 ## 6. Two flavors — and the overhead
 
 The cost hinges on **how many syscalls you stop on.** Each ptrace stop is two
@@ -111,12 +140,12 @@ microseconds. Overhead ≈ (stopped syscalls × per-stop cost) ÷ runtime.
   millions of syscalls, so this is the **heavy end: tens of percent to ~2×** for
   syscall-heavy phases.
 
-- **Accelerated (stop only on the open family) — recommended.** Install a small
-  seccomp filter that returns **`SECCOMP_RET_TRACE`** for the open family and
-  *allow* for everything else; Mirage attaches with `PTRACE_O_TRACESECCOMP` and
-  is stopped **only** on opens. Opens are a tiny fraction of all syscalls, so the
-  interception overhead collapses to **roughly the same as the seccomp design —
-  low single digits to ~25%.**
+- **Accelerated (stop only on the open/exec family) — the chosen path.** Install
+  a small seccomp filter that returns **`SECCOMP_RET_TRACE`** for the open + exec
+  family and *allow* for everything else; Mirage attaches with
+  `PTRACE_O_TRACESECCOMP` and is stopped **only** on those. They're a tiny
+  fraction of all syscalls, so the interception overhead collapses to **roughly
+  the same as the seccomp design — low single digits to ~25%.**
 
   Crucially, this **keeps the relaxed-parent property**: the tiny `RET_TRACE`
   filter is self-installed by the **orchestrator** (your code — just

@@ -33,24 +33,43 @@ orchestrator (PID 1, unchanged)          mirage-server (side process, CAP_SYS_PT
 - The OSS package keeps its seccomp listener for its syscalls; Mirage uses ptrace
   for file syscalls. Coexist — different mechanisms, disjoint syscalls.
 
-## 3. Two flavors
+## 3. Chosen flavor: accelerated
 
-- **Accelerated (recommended).** The **orchestrator self-installs** a small
-  seccomp filter returning `SECCOMP_RET_TRACE` for the file-open + exec family
-  (allow everything else); Mirage attaches with `PTRACE_O_TRACESECCOMP` and is
-  stopped **only** on those syscalls → ~seccomp-level overhead. The filter is a
-  non-listener filter (no `NEW_LISTENER`), so it stacks with the package's
-  listener with **no `EBUSY`**, and they target disjoint syscalls. mirage stays
-  a side process (orchestrator installs the filter, not mirage).
-- **Pure (fallback).** No seccomp at all; Mirage uses `PTRACE_SYSCALL` and stops
-  on **every** syscall, filtering for the ones it cares about itself. Zero code
-  in the orchestrator, but heavy overhead (tens of % to ~2× on syscall-heavy
-  workloads). Use only if the orchestrator filter can't be added.
+**Decision: accelerated.** (Pure ptrace remains a documented fallback only if the
+orchestrator filter can't be added.)
+
+- **Accelerated (CHOSEN).** The **orchestrator installs** a small seccomp filter
+  returning `SECCOMP_RET_TRACE` for the file-open + exec family (allow everything
+  else); Mirage attaches with `PTRACE_O_TRACESECCOMP` and is stopped **only** on
+  those syscalls → ~seccomp-level overhead. The filter is a non-listener filter
+  (no `NEW_LISTENER`), so it stacks with the package's listener with **no
+  `EBUSY`**, and they target disjoint syscalls. mirage stays a side process
+  (orchestrator installs the filter, not mirage — see §4.1 for *why* and *how*).
+- **Pure (fallback only).** No seccomp at all; Mirage uses `PTRACE_SYSCALL` and
+  stops on **every** syscall, filtering itself. Zero orchestrator code, but heavy
+  overhead (tens of % to ~2×). Use only if the orchestrator filter can't be added.
+
+### Division of labor (read this — it's the common point of confusion)
+
+- **mirage-server does ALL the interception:** attach, follow children, read the
+  path on each open/exec stop, materialize, resume. It is a **separate process**
+  (CAP_SYS_PTRACE).
+- **The orchestrator does exactly ONE thing:** install the tiny `RET_TRACE`
+  filter (the "notify mirage on open/exec" wiring). No path checks, no
+  materialization, no interception logic. After installing it, the orchestrator
+  runs the harness as normal and is unaware mirage exists.
+- **Why the orchestrator and not mirage installs it:** a seccomp filter can only
+  be installed by the process it applies to (on itself). mirage side-attaches —
+  it is *not* the orchestrator's parent — so it physically cannot install the
+  filter into the orchestrator. Hence the orchestrator self-installs; mirage does
+  everything after.
 
 ## 4. The RET_TRACE filter (accelerated)
 
-Installed by the orchestrator at startup: `prctl(PR_SET_NO_NEW_PRIVS, 1)` then a
-seccomp filter (no listener, no fd — no deadlock risk). Returns `RET_TRACE` for:
+Installed by the orchestrator **when a CLI session begins** (NOT at the container
+entrypoint — see §4.2): `prctl(PR_SET_NO_NEW_PRIVS, 1)` then a seccomp filter
+(no listener, no fd — no deadlock risk; apply to all threads via TSYNC). Returns
+`RET_TRACE` for:
 
 - **Open family** (arch-correct — a missing entry is a silent hole → placeholder
   zeros): x86_64 `open`(2)/`openat`(257)/`openat2`(437)/`creat`(85);
@@ -62,6 +81,48 @@ Coexistence: the package's filter returns `USER_NOTIF` for *its* syscalls and
 `ALLOW` for ours; our filter returns `TRACE` for ours and `ALLOW` for the
 package's. Per-syscall the kernel evaluates both and the matching action wins
 (disjoint sets → no contention). Install order doesn't matter.
+
+### 4.1 Delivering the filter-install to the (Python) orchestrator
+
+The orchestrator is Python, and it CAN install the filter — it's just
+`prctl` + `seccomp` syscalls. Don't make the orchestrator team hand-roll BPF.
+**Mirage ships the capability as a small package the orchestrator imports and
+calls once:**
+
+```python
+import mirage_trace
+mirage_trace.enable(workspace_root="/workspace", supervisor=…)  # at CLI-session start
+# … then run the harness as normal
+```
+
+`mirage_trace.enable()` encapsulates everything fiddly:
+1. tell mirage-server "attach to me (PID …)";
+2. **wait until mirage confirms it has seized the process** (ordering — §4.2);
+3. install the `RET_TRACE` filter (open+exec family, all threads via TSYNC,
+   `no_new_privs`);
+4. return.
+
+Implement it with the **libseccomp Python bindings** (`seccomp` package —
+arch-aware, supports the `TRACE` action, handles `no_new_privs`/TSYNC; cleanest)
+or self-contained **ctypes** (no dependency; you maintain the per-arch syscall
+numbers). Either way the orchestrator only ever sees `enable()`. (A `mirage-trace
+enable` CLI can wrap the same code for non-Python callers.)
+
+### 4.2 Install timing — conditional, and AFTER attach (avoids ENOSYS)
+
+A `RET_TRACE` syscall with **no tracer attached returns `-ENOSYS`** (the call
+fails). Two consequences:
+
+- **Conditional, not at the entrypoint.** In the shared web+CLI task pool, a task
+  only learns it's a CLI session after the SQS pickup. If the filter were
+  installed at the container entrypoint, **web sessions (no mirage attached)
+  would get `ENOSYS` on every open/exec and break.** So install it **only on the
+  CLI path**, after pickup — which is exactly why it's a *callable* the
+  orchestrator invokes, not a startup wrapper. (A startup wrapper would only be
+  safe with split web/CLI task definitions.)
+- **Attach before install.** mirage must be attached before the filter starts
+  generating trace events, or the orchestrator's own opens hit `ENOSYS`. Hence
+  `enable()` orders it as attach → confirm → install.
 
 ## 5. The tracer (mirage-server)
 
