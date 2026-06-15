@@ -39,11 +39,14 @@ CLI (laptop)              AWS (private subnet, behind ALB)
    │  validate token · route · splice bytes (dumb forwarder) · stateless fleet
    └──────────────┬────────────────┘
                   ▼
-   ┌── autopilot-orchestrator ECS task ──────────────────────────┐
-   │ mirage-server (PID 1, entrypoint)                            │
-   │   └─ orchestrator (ONE python process: poller + harness)     │
-   │        └─ git, rg, language servers, … (harness's tools)     │
-   └──────────────────────────────────────────────────────────────┘
+   ┌── autopilot-orchestrator ECS task ──────────────────────────────┐
+   │ orchestrator (PID 1, entrypoint; ONE python process: poller +    │
+   │   harness) ── calls mirage_trace.enable() at CLI-session start ──┐│
+   │        └─ git, rg, language servers, … (harness's tools)         ││
+   │                                                                  ▼│
+   │ mirage-server (side process, CAP_SYS_PTRACE) ── ptrace SEIZE ────┘│
+   │   intercepts open/exec, materializes, resumes                     │
+   └────────────────────────────────────────────────────────────────────┘
 ```
 
 **Control plane = session service (Python).** **Data plane = Mirage file
@@ -55,44 +58,44 @@ events).
 
 ## 3. Decisions
 
-### Process model
-- **mirage-server is the container entrypoint (PID 1)** and launches the whole
-  one-process orchestrator (poller + harness) as its workload. **No process
-  split** — the orchestrator stays one Python process; it runs as mirage-server's
-  child. mirage-server is the ancestor of the harness tree (required for
-  seccomp's `/proc/<pid>/mem` reads under `ptrace_scope=1`) and PID 1 handles
-  reaping + daemonized descendants.
-- mirage-server must **launch its workload at startup** (not after the client
-  publishes), because the poller must run immediately to grab the SQS message
-  and register the ARN before any CLI connects. mirage-server builds the
-  **skeleton on publish** and blocks any early `/workspace` open until ready.
-  (This launch-at-startup / workload-outlives-connection model is also what
-  reconnect needs — see §6.)
-- **Alternative front-end — ptrace (see `how-ptrace-interception-works.md`).**
-  If the sandbox runs an OSS package that owns the one seccomp notification
-  listener (only one is allowed per process tree), Mirage can't also use seccomp
-  there. The fallback is **ptrace-based interception**: with `CAP_SYS_PTRACE`
-  (allowed on Fargate) Mirage **side-attaches** and no longer needs to be PID 1 /
-  the launcher / an ancestor — which *dissolves* this whole process-model section
-  (orchestrator stays PID 1, no inversion, no split). Use the **accelerated**
-  flavor (a tiny `RET_TRACE` seccomp filter self-installed by the orchestrator)
-  for ~seccomp-level overhead while keeping the relaxed-parent property; pure
-  ptrace (every syscall) is the simple-but-heavy fallback. Coexists with the
-  package's listener (different mechanisms, disjoint syscalls, no `EBUSY`).
-  **Decision pending an overhead prototype.**
+### Process model (CHOSEN: ptrace side-attach)
 
-### Shared pool: web + CLI
-- **One shared task pool.** mirage-server is always PID 1, even for web sessions
-  (idle/unused there — harmless).
-- **Open decision — the seccomp *filter*, not mirage-server, is the cost.** If
-  the filter is always on, web sessions pay a per-open trap tax (every `open`
-  round-trips to the supervisor for a no-op decision) and web workspaces **must**
-  live outside the projected `/workspace`. Plan: **start with always-on (simple),
-  guarantee web workspaces are outside `/workspace`, MEASURE the tax on a real
-  web workload; if material, make the filter conditional on session type** (CLI
-  only). Conditional install at the CLI moment needs either orchestrator
-  self-install (Python — has the install→hand-off deadlock foot-gun) or launching
-  the harness under the C launcher (a CLI-only subprocess).
+The interception mechanism is **accelerated ptrace** (design:
+`design-ptrace-interception.md`; tour: `how-ptrace-interception-works.md`). This
+was chosen over the original seccomp-PID-1 model because the sandbox runs an OSS
+package that already owns the one seccomp notification listener allowed per
+process tree, and because side-attach removes the structural complexity.
+
+- **The orchestrator stays the entrypoint (PID 1) and one Python process** —
+  poller + harness, unchanged. No inversion, no process split, no launcher.
+- **mirage-server runs as a separate side process** with `CAP_SYS_PTRACE`
+  (allowed on Fargate). It `PTRACE_SEIZE`s the orchestrator/harness from the side
+  (the cap bypasses the `ptrace_scope=1` ancestor rule) and intercepts file
+  `open`/`exec` to materialize workspace files. It is **not** the parent and need
+  not be PID 1.
+- **The orchestrator opts in with one call:** `mirage_trace.enable()` at the
+  start of a CLI session — it coordinates the attach handshake and installs a
+  tiny `RET_TRACE` seccomp filter (open + exec family). That filter is a
+  non-listener filter, so it **coexists with the OSS package's listener** (no
+  `EBUSY`). All interception logic is in mirage-server; the orchestrator's only
+  job is that one call. (See design §3/§4.)
+- **Overhead:** accelerated traps only open/exec → ~seccomp-level; pure ptrace
+  (no filter, every syscall) is the heavy fallback. Decision = accelerated,
+  pending a prototype measurement (issue PT7).
+
+> Historical: the seccomp-as-mirage-server-PID-1 model (entrypoint inversion,
+> launch-at-startup, the no-split gymnastics) is superseded by the above. It
+> survives as the seccomp front-end where no other listener competes.
+
+### Shared pool: web + CLI (clean under ptrace)
+- **One shared task pool**, and under ptrace the web/CLI split is clean: a web
+  session simply **never calls `mirage_trace.enable()`** → no filter installed,
+  mirage-server never attaches → **zero interception cost and no `ENOSYS`** for
+  web. Only CLI sessions opt in.
+- Two correctness rules the call must honor (both handled inside `enable()`):
+  install the filter **only on the CLI path** (a `RET_TRACE` syscall with no
+  tracer returns `ENOSYS`, so a web session must not have the filter), and **only
+  after mirage has attached** (ordering). See design §4.2.
 
 ### Connection, routing, auth
 *(Full design + task breakdown in §5 and §6 — this is the next build target.)*
@@ -145,11 +148,13 @@ events).
   to the current turn (completed turns already synced).
 
 ### Build order
-1. Mirage **write-back** (server + client) and **reconnect** (heartbeats + grace
-   + re-attach), plus the launch-at-startup lifecycle change.
-2. **S4** (manifest mtime + size) — prerequisite for the write-back rescan.
-3. The **Go data-plane proxy** (routing + auth).
-4. Auth validation in mirage-server; web/CLI filter measurement → conditional if needed.
+1. **ptrace interception front-end** — `mirage_trace` + the tracer/handshake +
+   open/exec handling (the `[Ptrace]` milestone). This is the interception path.
+2. Mirage **write-back** (server + client) and **reconnect** (heartbeats + grace
+   + re-attach to the existing tracer/supervisor).
+3. **S4** (manifest mtime + size) — prerequisite for the write-back rescan.
+4. The **Go data-plane proxy** (routing + auth).
+5. Token-verification mechanism + mirage-server independent auth validation.
 
 ---
 
