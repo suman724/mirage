@@ -76,6 +76,11 @@ seccomp-server-validate: ## the production path: real mirage-server --seccomp dr
 	docker build -t mirage-validate -f Dockerfile .
 	docker run --rm mirage-validate bash scripts/seccomp-server-validate.sh
 
+.PHONY: ptrace-validate
+ptrace-validate: ## build a Linux image and run the ptrace interception validation (C trace-launcher + Go tracer, open+exec traps, incl. a static Go binary) — needs Docker
+	docker build -t mirage-validate -f Dockerfile .
+	docker run --rm --cap-add SYS_PTRACE mirage-validate bash scripts/ptrace-validate.sh
+
 .PHONY: vet
 vet: ## go vet
 	go vet ./...
