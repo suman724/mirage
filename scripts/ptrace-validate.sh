@@ -38,6 +38,22 @@ run() {
         -- "$@" >"$outf" 2>/tmp/run.err
 }
 
+# run_sideattach <root> <outfile> -- <cmd...> : the production topology. The
+# tracer runs detached (--no-spawn) and the trace-launcher attaches as an
+# INDEPENDENT process (a child of this shell, NOT of the tracer) — so the seize
+# is of a non-descendant, exercising CAP_SYS_PTRACE rather than the parent rule.
+run_sideattach() {
+    local root="$1" outf="$2"; shift 2
+    [ "$1" = "--" ] && shift
+    rm -rf "$root"
+    local sock=/tmp/attach.sock
+    rm -f "$sock"
+    "$H" --src "$FIX" --root "$root" --no-spawn --attach-sock "$sock" --log-level error 2>/tmp/run.err &
+    local hpid=$!
+    MIRAGE_ATTACH_SOCK="$sock" "$BIN/mirage-trace-launcher" "$@" >"$outf" 2>>/tmp/run.err
+    wait "$hpid"
+}
+
 stats() { grep -o 'PTRACE_STATS.*' /tmp/run.err || echo "PTRACE_STATS (none)"; }
 
 log "build harness, trace-launcher, and a STATIC Go reader (raw syscalls, bypasses libc)"
@@ -88,6 +104,12 @@ run "$ROOT" /tmp/out.exec -- "$ROOT/run.sh"
 grep -q 'MIRAGE_EXEC_OK' /tmp/out.exec || fail "executing workspace script failed: $(cat /tmp/out.exec 2>/dev/null)"
 grep -q 'errors=0' /tmp/run.err || fail "tracer reported errors on exec: $(stats)"
 echo "  exec of workspace file OK — $(stats)"
+
+log "HEADLINE 3: SIDE-ATTACH — tracer attaches to a NON-DESCENDANT process (CAP_SYS_PTRACE)"
+run_sideattach "$ROOT" /tmp/out.side -- "$BIN/static-reader" "$ROOT/sub/deep/big.bin"
+cmp /tmp/out.side "$FIX/sub/deep/big.bin" || fail "side-attach: read wrong content"
+grep -q 'errors=0' /tmp/run.err || fail "side-attach: tracer reported errors: $(stats)"
+echo "  side-attach to non-descendant OK — $(stats)"
 
 log "laziness: only the opened file materialized; siblings stay sparse"
 run "$ROOT" /tmp/out.bin -- "$BIN/static-reader" "$ROOT/sub/deep/big.bin"

@@ -43,6 +43,8 @@ func main() {
 	seccompState := flag.String("seccomp-state", "", "seccomp mode: persistent dir for the state journal, chunk cache and launcher socket (default: per-connection temp dir)")
 	launcher := flag.String("seccomp-launcher", "mirage-launcher", "seccomp mode: path to the mirage-launcher binary")
 	workers := flag.Int("seccomp-workers", 0, "seccomp mode: concurrent notification handlers (0 = default)")
+	ptraceDir := flag.String("ptrace", "", "directory to project as a lazy skeleton, materialized via ptrace side-attach to a workload the orchestrator owns (needs CAP_SYS_PTRACE); the orchestrator connects to the attach socket")
+	ptraceState := flag.String("ptrace-state", "", "ptrace mode: persistent dir for the state journal, chunk cache and attach socket (default: per-connection temp dir)")
 	healthAddr := flag.String("health-addr", "", "if set, serve an HTTP health endpoint at this address (GET /healthz -> 200) for ALB/ELB health checks")
 	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := flag.String("log-format", "text", "log format: text|json")
@@ -53,13 +55,13 @@ func main() {
 
 	// Exactly one projection mode (besides the default reconstruct).
 	modes := 0
-	for _, on := range []bool{*mount != "", *shimDir != "", *seccompDir != ""} {
+	for _, on := range []bool{*mount != "", *shimDir != "", *seccompDir != "", *ptraceDir != ""} {
 		if on {
 			modes++
 		}
 	}
 	if modes > 1 {
-		log.Error("--mount, --shim and --seccomp are mutually exclusive")
+		log.Error("--mount, --shim, --seccomp and --ptrace are mutually exclusive")
 		os.Exit(2)
 	}
 	if *shimState != "" && *shimDir == "" {
@@ -68,6 +70,10 @@ func main() {
 	}
 	if *seccompState != "" && *seccompDir == "" {
 		log.Error("--seccomp-state requires --seccomp")
+		os.Exit(2)
+	}
+	if *ptraceState != "" && *ptraceDir == "" {
+		log.Error("--ptrace-state requires --ptrace")
 		os.Exit(2)
 	}
 	if *seccompDir != "" && len(workload) == 0 {
@@ -109,6 +115,12 @@ func main() {
 			log.Info("workspace projected; running workload under seccomp interception",
 				"root", si.Root, "state", si.StateDir, "workload", si.Workload)
 		}, log)
+	case *ptraceDir != "":
+		srv = transport.NewPtrace(*ptraceDir, *ptraceState, func(pi transport.PtraceInfo) {
+			log.Info("workspace projected; ptrace tracer listening for orchestrator attach",
+				"root", pi.Root, "state", pi.StateDir, "attach_sock", pi.AttachSock)
+			log.Info("orchestrator should attach with", "MIRAGE_ATTACH_SOCK", pi.AttachSock)
+		}, log)
 	default:
 		srv = transport.New(*out, nil, log)
 	}
@@ -136,6 +148,8 @@ func main() {
 		mode, target = "shim", *shimDir
 	case *seccompDir != "":
 		mode, target = "seccomp", *seccompDir
+	case *ptraceDir != "":
+		mode, target = "ptrace", *ptraceDir
 	}
 	log.Info("mirage-server listening; waiting for client to dial in",
 		"addr", *addr, "mode", mode, "target", target)

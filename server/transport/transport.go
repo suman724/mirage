@@ -32,6 +32,7 @@ import (
 	miragev1 "github.com/suman724/mirage/proto/mirage/v1"
 	"github.com/suman724/mirage/server/channelstore"
 	miragefuse "github.com/suman724/mirage/server/fuse"
+	"github.com/suman724/mirage/server/ptrace"
 	"github.com/suman724/mirage/server/seccomp"
 	"github.com/suman724/mirage/server/shim"
 )
@@ -81,6 +82,19 @@ type SeccompInfo struct {
 	Requests func() uint64 // live count of chunks faulted over the wire so far
 }
 
+// PtraceInfo is reported once a connection's workspace skeleton is built and
+// the ptrace tracer is listening on the attach socket (ptrace mode,
+// docs/design-ptrace-interception.md). Unlike seccomp mode, mirage-server does
+// NOT launch the workload: it SIDE-ATTACHES to a workload the orchestrator owns,
+// which connects to AttachSock and requests attach (then self-installs the
+// RET_TRACE filter). Needs CAP_SYS_PTRACE to attach a non-descendant.
+type PtraceInfo struct {
+	Root       string        // workspace root holding the skeleton (symlink-resolved)
+	StateDir   string        // journal + chunk cache location for this session
+	AttachSock string        // unix socket the orchestrator connects to (export as MIRAGE_ATTACH_SOCK)
+	Requests   func() uint64 // live count of chunks faulted over the wire so far
+}
+
 // Server implements miragev1.MirageServer. Per connection it either
 // reconstructs the published index into outDir (reconstruct mode) or FUSE-mounts
 // it at mountDir so reads fault chunks lazily (mount mode).
@@ -90,7 +104,8 @@ type Server struct {
 	mountDir   string
 	shimDir    string
 	seccompDir string   // seccomp mode: workspace projection root
-	stateDir   string   // shim/seccomp mode: journal + cache + socket; empty = per-connection temp
+	ptraceDir  string   // ptrace mode: workspace projection root
+	stateDir   string   // shim/seccomp/ptrace mode: journal + cache + socket; empty = per-connection temp
 	launcher   string   // seccomp mode: path to the mirage-launcher binary
 	workload   []string // seccomp mode: command run under interception
 	workers    int      // seccomp mode: concurrent notification handlers (0 => default)
@@ -99,6 +114,7 @@ type Server struct {
 	onMounted  func(MountInfo)
 	onShim     func(ShimInfo)
 	onSeccomp  func(SeccompInfo)
+	onPtrace   func(PtraceInfo)
 	log        *slog.Logger
 }
 
@@ -169,6 +185,33 @@ func NewSeccomp(seccompDir, stateDir, launcher string, workload []string, worker
 		sandboxID:  "mirage-sandbox-0",
 		onSeccomp:  onSeccomp,
 		log:        logging.OrDefault(logger),
+	}
+}
+
+// NewPtrace returns a Server running the ptrace interception front-end
+// (docs/design-ptrace-interception.md), the alternative to seccomp for when
+// another component owns the one seccomp notification listener, or to avoid
+// making mirage-server the workload's parent.
+//
+// On each connection, after the skeleton is built, the server listens on an
+// attach socket in stateDir and SIDE-ATTACHES (PTRACE_SEIZE) to whatever
+// workload connects and requests "ATTACH <pid>" — typically the orchestrator
+// via the mirage_trace helper, which then self-installs a SECCOMP_RET_TRACE
+// filter (open+exec family). Because the workload is NOT a descendant of
+// mirage-server, attaching needs CAP_SYS_PTRACE (allowed on Fargate). The
+// tracer materializes files as the workload opens/executes them, and detaches
+// (leaving the workload running) when the client disconnects.
+//
+// stateDir holds the state journal, chunk cache, and the attach socket; empty
+// uses a per-connection temp dir (no restart recovery). onPtrace may be nil.
+// logger may be nil.
+func NewPtrace(ptraceDir, stateDir string, onPtrace func(PtraceInfo), logger *slog.Logger) *Server {
+	return &Server{
+		ptraceDir: ptraceDir,
+		stateDir:  stateDir,
+		sandboxID: "mirage-sandbox-0",
+		onPtrace:  onPtrace,
+		log:       logging.OrDefault(logger),
 	}
 }
 
@@ -321,14 +364,19 @@ func (s *Server) mode() string {
 		return "shim"
 	case s.seccompDir != "":
 		return "seccomp"
+	case s.ptraceDir != "":
+		return "ptrace"
 	default:
 		return "reconstruct"
 	}
 }
 
 // projecting reports whether this server projects a real skeleton on disk
-// (shim or seccomp mode), which needs a state dir for the journal + cache.
-func (s *Server) projecting() bool { return s.shimDir != "" || s.seccompDir != "" }
+// (shim, seccomp, or ptrace mode), which needs a state dir for the journal +
+// cache.
+func (s *Server) projecting() bool {
+	return s.shimDir != "" || s.seccompDir != "" || s.ptraceDir != ""
+}
 
 // sessionDirs resolves where this connection's state journal (shim mode) and
 // chunk cache live, returning a cleanup for whatever is session-scoped. A
@@ -379,6 +427,8 @@ func (s *Server) drive(ctx context.Context, m *chunk.Manifest, store desync.Stor
 		return s.serveShim(ctx, m, store, cs, stateDir)
 	case s.seccompDir != "":
 		return s.serveSeccomp(ctx, m, store, cs, stateDir)
+	case s.ptraceDir != "":
+		return s.servePtrace(ctx, m, store, cs, stateDir)
 	default:
 		return s.reconstruct(ctx, m, store)
 	}
@@ -609,6 +659,74 @@ func (s *Server) killGroup(child *exec.Cmd) {
 		s.log.Debug("kill workload process group; falling back to single process", "err", err)
 		_ = child.Process.Kill()
 	}
+}
+
+// servePtrace builds the skeleton under ptraceDir, then listens on an attach
+// socket and SIDE-ATTACHES to whatever workload the orchestrator connects with
+// (docs/design-ptrace-interception.md). It does NOT launch the workload. The
+// tracer materializes files through the same shim.Materializer the other modes
+// use, and runs until the workload exits or the client disconnects — on
+// disconnect it detaches, leaving the workload running (the orchestrator owns
+// it). Nothing to unmount; whatever was materialized or written stays on disk.
+func (s *Server) servePtrace(ctx context.Context, m *chunk.Manifest, store desync.Store, cs *channelstore.Store, stateDir string) Result {
+	res := Result{TotalRefs: uint64(m.TotalChunks())}
+	if err := os.MkdirAll(s.ptraceDir, 0o755); err != nil {
+		res.Err = fmt.Errorf("transport: create ptrace dir %q: %w", s.ptraceDir, err)
+		return res
+	}
+	table, err := shim.OpenTable(filepath.Join(stateDir, "journal.jsonl"), s.log)
+	if err != nil {
+		res.Err = fmt.Errorf("transport: open ptrace state: %w", err)
+		return res
+	}
+	defer func() {
+		if err := table.Close(); err != nil {
+			s.log.Warn("close ptrace state journal", "err", err)
+		}
+	}()
+
+	buildTime := time.Now()
+	skel, err := shim.BuildSkeleton(s.ptraceDir, m, table, buildTime, s.log)
+	if err != nil {
+		res.Err = fmt.Errorf("transport: build skeleton: %w", err)
+		return res
+	}
+	res.Files = skel.Files
+	res.Bytes = skel.Bytes
+
+	mat, err := shim.NewMaterializer(s.ptraceDir, m, store, table, buildTime, s.log)
+	if err != nil {
+		res.Err = fmt.Errorf("transport: build materializer: %w", err)
+		return res
+	}
+	tracer, err := ptrace.New(mat, s.log)
+	if err != nil {
+		// On non-Linux this is ptrace.ErrUnsupported (the mode is Linux-only).
+		res.Err = fmt.Errorf("transport: start ptrace tracer: %w", err)
+		return res
+	}
+
+	attachSock := filepath.Join(stateDir, "attach.sock")
+	if s.onPtrace != nil {
+		s.onPtrace(PtraceInfo{
+			Root:       mat.Root(),
+			StateDir:   stateDir,
+			AttachSock: attachSock,
+			Requests:   cs.Requests,
+		})
+	}
+
+	// Serve until the workload exits (Serve returns nil) or the client
+	// disconnects (ctx cancel -> Serve detaches the tracees and returns
+	// context.Canceled, which is not an error here).
+	if err := tracer.Serve(ctx, attachSock); err != nil && err != context.Canceled {
+		res.Err = fmt.Errorf("transport: ptrace serve: %w", err)
+		return res
+	}
+	st := tracer.Stats()
+	s.log.Info("ptrace tracer finished",
+		"traps", st.Traps, "workspace", st.Workspace, "errors", st.Errors, "exit", tracer.ExitCode())
+	return res
 }
 
 // serveMount FUSE-mounts the manifest at mountDir, backed by the store chain,

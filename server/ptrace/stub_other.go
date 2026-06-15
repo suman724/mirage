@@ -6,6 +6,7 @@
 package ptrace
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 )
@@ -32,7 +33,7 @@ type Tracer struct{}
 func New(_ Materializer, _ *slog.Logger) (*Tracer, error) { return nil, ErrUnsupported }
 
 // Serve returns ErrUnsupported off Linux.
-func (t *Tracer) Serve(_ string) error { return ErrUnsupported }
+func (t *Tracer) Serve(_ context.Context, _ string) error { return ErrUnsupported }
 
 // ExitCode returns -1 off Linux.
 func (t *Tracer) ExitCode() int { return -1 }

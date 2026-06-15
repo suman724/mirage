@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -34,13 +35,19 @@ func main() {
 	src := flag.String("src", "", "fixture directory to publish (chunked into an in-memory store)")
 	root := flag.String("root", "", "workspace directory to project the skeleton into")
 	launcher := flag.String("launcher", "./bin/mirage-trace-launcher", "path to the mirage-trace-launcher binary")
+	attachSockFlag := flag.String("attach-sock", "", "attach socket path (default: <state>/attach.sock)")
+	noSpawn := flag.Bool("no-spawn", false, "do NOT spawn the launcher; only run the tracer and wait for an EXTERNAL process to attach (validates side-attach to a non-descendant — needs CAP_SYS_PTRACE)")
 	logLevel := flag.String("log-level", "info", "log level")
 	flag.Parse()
 	cmdArgs := flag.Args()
 
 	log := logging.Setup(*logLevel, "text")
-	if *src == "" || *root == "" || len(cmdArgs) == 0 {
-		log.Error("usage: --src DIR --root DIR [--launcher PATH] -- CMD [ARGS...]")
+	if *src == "" || *root == "" {
+		log.Error("usage: --src DIR --root DIR [--launcher PATH] [--no-spawn] -- CMD [ARGS...]")
+		os.Exit(2)
+	}
+	if !*noSpawn && len(cmdArgs) == 0 {
+		log.Error("a workload command is required after -- unless --no-spawn is set")
 		os.Exit(2)
 	}
 
@@ -84,20 +91,30 @@ func main() {
 		log.Error("ptrace tracer", "err", err)
 		os.Exit(1)
 	}
-	attachSock := stateDir + "/attach.sock"
+	attachSock := *attachSockFlag
+	if attachSock == "" {
+		attachSock = stateDir + "/attach.sock"
+	}
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- tracer.Serve(attachSock) }()
+	go func() { serveErr <- tracer.Serve(context.Background(), attachSock) }()
 
-	// 4. Spawn the trace-launcher. It connects to attachSock, sends
-	//    "ATTACH <pid>", waits for the tracer to seize it, installs the
-	//    RET_TRACE filter, then execs the workload. We do NOT Wait() on it —
-	//    the tracer's ptrace loop reaps it (see package doc).
-	child := exec.Command(*launcher, cmdArgs...)
-	child.Env = append(os.Environ(), "MIRAGE_ATTACH_SOCK="+attachSock)
-	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := child.Start(); err != nil {
-		log.Error("start trace-launcher", "err", err)
-		os.Exit(1)
+	// 4. Get the workload under trace. In the default (self-contained) mode we
+	//    spawn the trace-launcher as our own child; it connects to attachSock,
+	//    sends "ATTACH <pid>", waits for the seize, installs the RET_TRACE
+	//    filter, then execs the workload. We do NOT Wait() on it — the tracer's
+	//    ptrace loop reaps it. In --no-spawn mode we launch nothing: an EXTERNAL
+	//    process attaches (side-attach to a non-descendant), which is the
+	//    production topology and needs CAP_SYS_PTRACE.
+	if !*noSpawn {
+		child := exec.Command(*launcher, cmdArgs...)
+		child.Env = append(os.Environ(), "MIRAGE_ATTACH_SOCK="+attachSock)
+		child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := child.Start(); err != nil {
+			log.Error("start trace-launcher", "err", err)
+			os.Exit(1)
+		}
+	} else {
+		log.Info("no-spawn: waiting for an external process to attach", "attach_sock", attachSock)
 	}
 
 	// 5. The tracer returns when the root workload exits.
