@@ -1,9 +1,11 @@
 # Design — ptrace interception front-end
 
-**Status:** design, not built. Engineering spec for Mirage's **ptrace-based**
-interception front-end — the alternative to the seccomp user-notification
-front-end. Plain-language background: `how-ptrace-interception-works.md`.
-Tracking: GitHub milestone *"Ptrace interception front-end"* / `[Ptrace]` issues.
+**Status:** core mechanism **built and validated** (Docker/arm64); production
+server-mode wiring not yet done — see §13. Engineering spec for Mirage's
+**ptrace-based** interception front-end — the alternative to the seccomp
+user-notification front-end. Plain-language background:
+`how-ptrace-interception-works.md`. Tracking: GitHub milestone *"Ptrace
+interception front-end"* / `[Ptrace]` issues.
 
 ## 1. When this path is used
 
@@ -251,3 +253,50 @@ See the `[Ptrace]` issues under the *"Ptrace interception front-end"* milestone
 (tracking issue links the set): RET_TRACE filter, tracer core, open handling,
 exec handling, attach/ordering, CAP + coexistence validation, overhead
 prototype, Docker harness, flavor decision.
+
+## 13. Implementation status (2026-06-15)
+
+**Built and validated** (commit on `feature/shimmer`):
+
+- `server/ptrace/` — the tracer. `Tracer.Serve(attachSock)` listens for one
+  `ATTACH <pid>` request, `PTRACE_SEIZE`s the target + its threads (with
+  `TRACEFORK|TRACEVFORK|TRACECLONE|TRACESECCOMP|TRACEEXEC|EXITKILL`), replies
+  `OK`, then runs the wait/dispatch loop on a single locked OS thread. On each
+  `PTRACE_EVENT_SECCOMP` it decodes the syscall + args via `PTRACE_GETREGSET`
+  (arch files `regs_amd64.go` / `regs_arm64.go`), reads the path from
+  `/proc/<pid>/mem`, resolves `*at` dirfd / `AT_FDCWD` via `/proc/<pid>/{fd,cwd}`,
+  and calls `shim.Materializer.Ensure` before `PTRACE_CONT`
+  (continue-after-materialize). Reuses the S1 materializer/skeleton/store
+  unchanged. `//go:build !linux` stub keeps the module cross-building.
+- `shim/trace-launcher.c` — `no_new_privs` → connect `MIRAGE_ATTACH_SOCK`
+  (with connect-retry) → `ATTACH <pid>` → block for `OK` → **only then** install
+  the `SECCOMP_RET_TRACE` filter (open **and** exec family, arch-correct, TSYNC)
+  → `execvp` the workload. Ordering avoids the no-tracer `ENOSYS` (§4.2).
+- `cmd/mirage-ptrace-harness` + `scripts/ptrace-validate.sh` + `make
+  ptrace-validate`.
+
+**Validation result (Docker, arm64, `--cap-add SYS_PTRACE`):** all checks pass,
+`errors=0`. Confirmed (a) a **static Go binary** (raw `openat`, no libc) reads
+real content via the open trap, and (b) **executing a workspace file** is
+intercepted via the exec trap — the case that is *not* an open (§6). Laziness
+holds (untouched files stay sparse). In the harness the tracer is the launcher's
+real parent, so the seize works without `CAP_SYS_PTRACE`; the cap is added to
+mirror production side-attach. **amd64 register/syscall decode compiles but is
+not yet runtime-validated** (local Docker is arm64) — run on an amd64 host/CI.
+
+**Not yet built:**
+
+- **mirage-server `--ptrace` mode** (wiring into `server/transport` + `main.go`,
+  symmetric to `--seccomp`). This forks on a CLI-integration decision still open:
+  *launcher mode* (mirage-server spawns the trace-launcher as its child, like
+  `serveSeccomp`) vs *side-attach mode* (the orchestrator owns the workload and
+  calls `mirage_trace.enable()`; mirage-server only runs `Tracer.Serve` on the
+  attach socket and attaches a non-descendant via `CAP_SYS_PTRACE`). Side-attach
+  is the reason ptrace was chosen and is structurally simpler (no child
+  management), but its gRPC-path validation needs a stand-in attacher. Decide
+  alongside the CLI integration (cli-integration-design.md §3).
+- `Tracer.Serve` taking a `context.Context` for teardown on client disconnect
+  (reconnect/detach semantics, §11; CLI issue #33).
+- The `mirage_trace` Python package (design §4.1) as a real repo artifact.
+- Coexistence test with a real second seccomp `NEW_LISTENER` holder (§10).
+- Overhead measurement on a real agent run (the gating §9 number).
