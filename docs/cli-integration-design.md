@@ -68,6 +68,18 @@ events).
   **skeleton on publish** and blocks any early `/workspace` open until ready.
   (This launch-at-startup / workload-outlives-connection model is also what
   reconnect needs — see §6.)
+- **Alternative front-end — ptrace (see `how-ptrace-interception-works.md`).**
+  If the sandbox runs an OSS package that owns the one seccomp notification
+  listener (only one is allowed per process tree), Mirage can't also use seccomp
+  there. The fallback is **ptrace-based interception**: with `CAP_SYS_PTRACE`
+  (allowed on Fargate) Mirage **side-attaches** and no longer needs to be PID 1 /
+  the launcher / an ancestor — which *dissolves* this whole process-model section
+  (orchestrator stays PID 1, no inversion, no split). Use the **accelerated**
+  flavor (a tiny `RET_TRACE` seccomp filter self-installed by the orchestrator)
+  for ~seccomp-level overhead while keeping the relaxed-parent property; pure
+  ptrace (every syscall) is the simple-but-heavy fallback. Coexists with the
+  package's listener (different mechanisms, disjoint syscalls, no `EBUSY`).
+  **Decision pending an overhead prototype.**
 
 ### Shared pool: web + CLI
 - **One shared task pool.** mirage-server is always PID 1, even for web sessions
