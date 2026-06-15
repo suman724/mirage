@@ -87,26 +87,53 @@ package's. Per-syscall the kernel evaluates both and the matching action wins
 The orchestrator is Python, and it CAN install the filter — it's just
 `prctl` + `seccomp` syscalls. Don't make the orchestrator team hand-roll BPF.
 **Mirage ships the capability as a small package the orchestrator imports and
-calls once:**
+calls once,** at the start of a CLI session, before the workspace is touched:
 
 ```python
 import mirage_trace
-mirage_trace.enable(workspace_root="/workspace", supervisor=…)  # at CLI-session start
+mirage_trace.enable(os.environ["MIRAGE_ATTACH_SOCK"])  # at CLI-session start
 # … then run the harness as normal
 ```
 
-`mirage_trace.enable()` encapsulates everything fiddly:
-1. tell mirage-server "attach to me (PID …)";
-2. **wait until mirage confirms it has seized the process** (ordering — §4.2);
-3. install the `RET_TRACE` filter (open+exec family, all threads via TSYNC,
-   `no_new_privs`);
-4. return.
+`enable()` does three things, in this mandatory order (the order avoids the
+ENOSYS trap of §4.2):
 
-Implement it with the **libseccomp Python bindings** (`seccomp` package —
-arch-aware, supports the `TRACE` action, handles `no_new_privs`/TSYNC; cleanest)
-or self-contained **ctypes** (no dependency; you maintain the per-arch syscall
-numbers). Either way the orchestrator only ever sees `enable()`. (A `mirage-trace
-enable` CLI can wrap the same code for non-Python callers.)
+```python
+def enable(supervisor_sock, timeout=10.0):
+    _request_attach(supervisor_sock, timeout)  # 1+2: ask mirage to seize us; BLOCK until "OK"
+    install_trace_filter()                      # 3: only now (tracer guaranteed present)
+```
+
+**Handshake** (`_request_attach`): connect to mirage-server's unix socket
+(`MIRAGE_ATTACH_SOCK`), send `ATTACH <pid>\n`, block until `OK\n`. **If anything
+fails, raise and do NOT install the filter** — installing it without a tracer
+would make every open return ENOSYS. Idempotent (guard against a second call).
+
+**Filter** (`install_trace_filter`) — libseccomp variant (cleanest):
+
+```python
+import seccomp
+OPEN = ("open", "openat", "openat2", "creat")
+EXEC = ("execve", "execveat")     # exec is NOT an open — must be trapped too (§6)
+def install_trace_filter(msg=0):
+    f = seccomp.SyscallFilter(defaction=seccomp.ALLOW)  # everything else runs normally
+    f.set_attr(seccomp.Attr.CTL_TSYNC, 1)               # apply to ALL threads
+    for name in OPEN + EXEC:
+        try: f.add_rule(seccomp.TRACE(msg), name)        # SECCOMP_RET_TRACE
+        except seccomp.SeccompSyscallResolveError: pass  # absent on this arch (e.g. open on arm64)
+    f.load()   # sets no_new_privs + installs (SET_MODE_FILTER, no listener → coexists, no EBUSY)
+```
+
+**ctypes fallback** (no dependency): `prctl(PR_SET_NO_NEW_PRIVS,1)` then
+`syscall(SYS_seccomp, SET_MODE_FILTER, FLAG_TSYNC, &prog)` with a hand-built BPF
+returning `RET_TRACE` for the open/exec syscall numbers, `RET_ALLOW` otherwise —
+same BPF shape as `shim/launcher.c`, swapping `RET_USER_NOTIF`→`RET_TRACE`,
+adding the exec syscalls and the TSYNC flag. More code + per-arch numbers; prefer
+libseccomp. (A `mirage-trace enable` CLI can wrap either for non-Python callers.)
+
+**Server side of the handshake** lives in mirage-server (§5/§7): on
+`ATTACH <pid>` it `PTRACE_SEIZE`s every thread in `/proc/<pid>/task` with the
+options below, then replies `OK` — only after the seize succeeds.
 
 ### 4.2 Install timing — conditional, and AFTER attach (avoids ENOSYS)
 
@@ -126,10 +153,11 @@ fails). Two consequences:
 
 ## 5. The tracer (mirage-server)
 
-- Attach: `PTRACE_SEIZE` the workload with options
-  `TRACEFORK|TRACEVFORK|TRACECLONE` (follow the whole tree),
-  `TRACESECCOMP` (receive `PTRACE_EVENT_SECCOMP` stops), `EXITKILL` (kill the
-  tracees if mirage dies — clean teardown).
+- Attach (driven by the handshake, §4.1/§7): on `ATTACH <pid>`, `PTRACE_SEIZE`
+  **every thread** in `/proc/<pid>/task` (re-scan to catch threads created during
+  the loop) with options `TRACEFORK|TRACEVFORK|TRACECLONE` (follow the whole
+  tree), `TRACESECCOMP` (receive `PTRACE_EVENT_SECCOMP` stops), `EXITKILL` (kill
+  the tracees if mirage dies). Reply `OK` only after the seize succeeds.
 - Event loop: `waitpid` for stops. On `PTRACE_EVENT_SECCOMP`:
   1. `PTRACE_GETREGS` → syscall nr + args (path pointer, dirfd, flags).
   2. Read the path string from the tracee's memory (`process_vm_readv` or
@@ -169,11 +197,14 @@ rewrite / fd injection is a possible future hardening, not required.
 
 ## 7. Attach bootstrapping & lifecycle
 
-- **PID discovery:** mirage needs the workload PID to seize it. Options: the
-  orchestrator hands mirage its PID over a local channel, or mirage seizes its
-  known target. Decide in implementation.
-- **Ordering:** attach (with the filter already installed) before workspace
-  access — else `ENOSYS` (§6).
+- **Handshake protocol:** mirage-server listens on a unix socket
+  (`MIRAGE_ATTACH_SOCK`). The orchestrator's `mirage_trace.enable()` connects and
+  sends `ATTACH <pid>\n`; mirage seizes the process's threads (§5) and replies
+  `OK\n`; only then does the orchestrator install the filter. This is the PID
+  discovery + ordering mechanism in one.
+- **Ordering:** seize must complete (mirage attached) **before** the filter is
+  installed, and the filter before any workspace open — else `ENOSYS` (§6). The
+  `enable()` sequence (attach → confirm → install) enforces this.
 - **Teardown:** `PTRACE_O_EXITKILL` so tracees die if mirage exits; on disconnect,
   mirage detaches/holds per the reconnect design.
 
