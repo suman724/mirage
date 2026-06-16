@@ -10,6 +10,8 @@ GOBIN := $(shell go env GOPATH)/bin
 export PATH := $(GOBIN):$(PATH)
 
 BIN := bin
+# C compiler for the LD_PRELOAD shim (Linux-only).
+CC ?= cc
 
 .PHONY: all
 all: tidy build test ## tidy, build, and test everything
@@ -27,6 +29,12 @@ tools: ## install the protoc plugins used by `make proto`
 build: ## build both binaries into ./bin
 	go build -o $(BIN)/mirage-server ./server
 	go build -o $(BIN)/mirage-client ./client
+
+.PHONY: shim-lib
+shim-lib: ## build the LD_PRELOAD shim libmirageshim.so into ./bin (Linux only; for --shim mode)
+	@mkdir -p $(BIN)
+	$(CC) -shared -fPIC -O2 -Wall -Wextra -Werror -o $(BIN)/libmirageshim.so shim/mirageshim.c -ldl
+	@echo "built $(BIN)/libmirageshim.so — use with: LD_PRELOAD=$(BIN)/libmirageshim.so MIRAGE_SHIM_ROOT=<root> MIRAGE_SHIM_SOCK=<sock>"
 
 .PHONY: test
 test: ## run all unit + integration tests
