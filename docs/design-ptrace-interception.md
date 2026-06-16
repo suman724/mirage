@@ -314,7 +314,13 @@ seizes that *non-descendant* via `CAP_SYS_PTRACE`. `Tracer.Serve` now takes a
 context: on client disconnect it `PTRACE_INTERRUPT`s + `PTRACE_DETACH`es every
 tracee (leaving the workload running) and returns `context.Canceled`. We also
 dropped `PTRACE_O_EXITKILL` so a tracer crash auto-detaches rather than killing
-the orchestrator's tree. Flags: `--ptrace DIR` / `--ptrace-state DIR` (mutually
+the orchestrator's tree. **Fail-loud (G3):** a workspace file that fails to
+materialize makes the open/exec fail with **EIO**, never a silent read of
+placeholder zeros — implemented by neutralizing the syscall at its entry stop
+(`orig_rax=-1` on amd64; `NT_ARM_SYSTEM_CALL=-1` on arm64) and overwriting the
+return register with `-EIO` at the exit stop (`PTRACE_O_TRACESYSGOOD` two-stop).
+Matches seccomp and the LD_PRELOAD shim. Validated by the `--fail-materialize`
+fault-injection case in `ptrace-validate.sh`. Flags: `--ptrace DIR` / `--ptrace-state DIR` (mutually
 exclusive with `--mount`/`--shim`/`--seccomp`). Validated by HEADLINE 3 in
 `ptrace-validate.sh` (side-attach to a non-descendant, `errors=0`).
 
