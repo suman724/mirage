@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mirage-trace"
+version = "0.1.0"
+description = "Opt a CLI session into Mirage's ptrace interception (install the RET_TRACE filter)."
+readme = "README.md"
+requires-python = ">=3.7"
+license = { text = "Apache-2.0" }
+# No required dependencies: enable() uses libseccomp if importable, else a
+# ctypes raw-syscall fallback. Linux only.
+
+[project.optional-dependencies]
+# Cleaner filter install when present; not required.
+libseccomp = ["seccomp"]
+
+[project.scripts]
+mirage-trace = "mirage_trace.__main__:main"
+
+[tool.setuptools]
+packages = ["mirage_trace"]

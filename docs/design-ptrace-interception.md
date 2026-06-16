@@ -1,8 +1,10 @@
 # Design — ptrace interception front-end
 
-**Status:** core mechanism **and the `--ptrace` side-attach server mode built
-and validated** (Docker/arm64); see §13. Remaining: amd64 runtime + gRPC-path
-e2e validation. Engineering spec for Mirage's
+**Status:** front-end **built and validated** (Docker/arm64) — core mechanism,
+`--ptrace` side-attach server mode, gRPC production path, and the `mirage_trace`
+Python helper; see §13. Remaining: amd64 *runtime* validation (needs a native
+amd64 host), reconnect, coexistence test, overhead measurement. Engineering spec
+for Mirage's
 **ptrace-based** interception front-end — the alternative to the seccomp
 user-notification front-end. Plain-language background:
 `how-ptrace-interception-works.md`. Tracking: GitHub milestone *"Ptrace
@@ -285,6 +287,22 @@ real parent, so the seize works without `CAP_SYS_PTRACE`; the cap is added to
 mirror production side-attach. **amd64 register/syscall decode compiles but is
 not yet runtime-validated** (local Docker is arm64) — run on an amd64 host/CI.
 
+**gRPC production path — validated.** `scripts/ptrace-server-validate.sh` /
+`make ptrace-server-validate`: the REAL `mirage-server --ptrace` driven by the
+REAL `mirage-client` over gRPC, with the workload attaching from an INDEPENDENT
+process (`trace-launcher`) — the Fargate shape minus the ALB. A libc tool and a
+static Go binary both read materialized files byte-identically, `/healthz`
+answers 200, no placeholder zeros leak.
+
+**`mirage_trace` Python package — built + validated.** `python/mirage_trace/`:
+`enable(attach_sock)` does the attach handshake then installs the `RET_TRACE`
+filter (open+exec, TSYNC, `no_new_privs`) — libseccomp if importable, else a
+dependency-free ctypes raw-syscall fallback that hand-builds the BPF (x86_64 +
+aarch64). Idempotent, fail-closed, Linux-only. Ships a `python -m mirage_trace
+<sock> -- <cmd>` CLI for non-Python callers. `make mirage-trace-validate` proves
+the orchestrator path end to end: Python self-installs the filter and the Go
+tracer materializes a workspace file (`errors=0`, ctypes path).
+
 **mirage-server `--ptrace` mode — built (side-attach).** Chosen over launcher
 mode because side-attach is the reason ptrace exists (mirage-server is NOT the
 workload's parent) and is structurally simpler (no child lifecycle, no
@@ -302,12 +320,13 @@ exclusive with `--mount`/`--shim`/`--seccomp`). Validated by HEADLINE 3 in
 
 **Not yet built:**
 
-- amd64 **runtime** validation (local Docker is arm64; amd64 only compiles).
-- The `--ptrace` mode's **gRPC-path** end-to-end validation (real mirage-server
-  `--ptrace` + mirage-client + an external attacher), analogous to
-  `seccomp-server-validate.sh`. The mechanism is validated without gRPC today.
+- amd64 **runtime** validation. The arm64 dev host can't do it: QEMU emulation
+  segfaults the Go/gcc toolchain and qemu-user can't faithfully emulate
+  ptrace/seccomp. Resolution: run `make ptrace-validate` / `ptrace-server-validate`
+  on a NATIVE amd64 host (the user's Fargate-class env or amd64 CI) — the scripts
+  build and run for the host arch, so on amd64 they exercise `regs_amd64.go` and
+  the x86_64 BPF directly. Code is ready; this is a CI/host task.
 - Reconnect/resume after a disconnect-then-reattach (detach side is done; the
   re-attach + grace-window policy is CLI issue #33).
-- The `mirage_trace` Python package (design §4.1) as a real repo artifact.
 - Coexistence test with a real second seccomp `NEW_LISTENER` holder (§10).
 - Overhead measurement on a real agent run (the gating §9 number).

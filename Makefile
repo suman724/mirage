@@ -77,9 +77,19 @@ seccomp-server-validate: ## the production path: real mirage-server --seccomp dr
 	docker run --rm mirage-validate bash scripts/seccomp-server-validate.sh
 
 .PHONY: ptrace-validate
-ptrace-validate: ## build a Linux image and run the ptrace interception validation (C trace-launcher + Go tracer, open+exec traps, incl. a static Go binary) — needs Docker
+ptrace-validate: ## ptrace interception validation (C trace-launcher + Go tracer, open+exec traps + side-attach, incl. a static Go binary) — needs Docker. On a NATIVE amd64 host this also validates the amd64 register decode (QEMU emulation can't: it segfaults the toolchain and can't faithfully emulate ptrace).
 	docker build -t mirage-validate -f Dockerfile .
 	docker run --rm --cap-add SYS_PTRACE mirage-validate bash scripts/ptrace-validate.sh
+
+.PHONY: ptrace-server-validate
+ptrace-server-validate: ## the production path: real mirage-server --ptrace + mirage-client over gRPC, workload side-attaches from an independent process — needs Docker
+	docker build -t mirage-validate -f Dockerfile .
+	docker run --rm --cap-add SYS_PTRACE mirage-validate bash scripts/ptrace-server-validate.sh
+
+.PHONY: mirage-trace-validate
+mirage-trace-validate: ## validate the mirage_trace Python helper: it self-installs the RET_TRACE filter and the Go tracer materializes a workspace file (ctypes fallback path) — needs Docker
+	docker build -t mirage-validate -f Dockerfile .
+	docker run --rm --cap-add SYS_PTRACE mirage-validate bash scripts/mirage-trace-validate.sh
 
 .PHONY: vet
 vet: ## go vet
