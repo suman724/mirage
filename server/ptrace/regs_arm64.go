@@ -2,7 +2,14 @@
 
 package ptrace
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+)
+
+// NT_ARM_SYSTEM_CALL: the regset used to change the dispatched syscall number on
+// arm64 (writing x8 via the GPR set does NOT change dispatch here, unlike x86).
+const ntArmSyscall = 0x404
 
 // arm64 user_pt_regs: regs[0..30] (x0..x30), then sp, pc, pstate. The syscall
 // number is in x8; syscall args are x0..x5. Offsets are index * 8.
@@ -43,4 +50,27 @@ func slot(regs []byte, idx int) uint64 {
 		return 0
 	}
 	return binary.LittleEndian.Uint64(regs[off:])
+}
+
+// setReturn overwrites x0 (the syscall return register) with val via the
+// general-purpose regset. Used to inject -EIO at a neutralized syscall's exit.
+func setReturn(pid int, val int64) error {
+	regs, err := getRegs(pid)
+	if err != nil {
+		return err
+	}
+	if len(regs) < 8 {
+		return fmt.Errorf("ptrace: regs too small for x0")
+	}
+	binary.LittleEndian.PutUint64(regs[0:], uint64(val)) // x0 = regs[0]
+	return setRegset(pid, ntPrStatus, regs)
+}
+
+// skipSyscall neutralizes the pending syscall by setting the dispatched number
+// to -1 via NT_ARM_SYSTEM_CALL (arm64's dedicated mechanism — the GPR set can't
+// do it). The caller then steps to the exit stop to set the return value.
+func skipSyscall(pid int) error {
+	b := make([]byte, 4)
+	binary.LittleEndian.PutUint32(b, ^uint32(0)) // (int)-1
+	return setRegset(pid, ntArmSyscall, b)
 }

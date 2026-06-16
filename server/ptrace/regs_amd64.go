@@ -2,7 +2,10 @@
 
 package ptrace
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // amd64 user_regs_struct layout (struct pt_regs), one uint64 per slot. We only
 // need orig_rax (the syscall number at entry) and the arg registers. Offsets
@@ -58,4 +61,37 @@ func slot(regs []byte, idx int) uint64 {
 		return 0
 	}
 	return binary.LittleEndian.Uint64(regs[off:])
+}
+
+// rax is register slot 10 — the syscall return value at exit.
+const regRax = 10
+
+// setReturn overwrites rax (the syscall return register) with val via the
+// general-purpose regset. Used to inject -EIO at a neutralized syscall's exit.
+func setReturn(pid int, val int64) error {
+	regs, err := getRegs(pid)
+	if err != nil {
+		return err
+	}
+	if regRax*8+8 > len(regs) {
+		return fmt.Errorf("ptrace: regs too small for rax")
+	}
+	binary.LittleEndian.PutUint64(regs[regRax*8:], uint64(val))
+	return setRegset(pid, ntPrStatus, regs)
+}
+
+// skipSyscall neutralizes the pending syscall so the kernel does not execute it,
+// by setting orig_rax to -1. On x86_64 the dispatched number lives in the GPR
+// set, so this is enough; the caller then steps to the exit stop to set the
+// return value.
+func skipSyscall(pid int) error {
+	regs, err := getRegs(pid)
+	if err != nil {
+		return err
+	}
+	if regOrigRax*8+8 > len(regs) {
+		return fmt.Errorf("ptrace: regs too small for orig_rax")
+	}
+	binary.LittleEndian.PutUint64(regs[regOrigRax*8:], ^uint64(0)) // -1
+	return setRegset(pid, ntPrStatus, regs)
 }

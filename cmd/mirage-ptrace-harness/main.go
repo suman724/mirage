@@ -37,6 +37,7 @@ func main() {
 	launcher := flag.String("launcher", "./bin/mirage-trace-launcher", "path to the mirage-trace-launcher binary")
 	attachSockFlag := flag.String("attach-sock", "", "attach socket path (default: <state>/attach.sock)")
 	noSpawn := flag.Bool("no-spawn", false, "do NOT spawn the launcher; only run the tracer and wait for an EXTERNAL process to attach (validates side-attach to a non-descendant — needs CAP_SYS_PTRACE)")
+	failMaterialize := flag.Bool("fail-materialize", false, "fault injection: make every chunk fetch fail, so each workspace open must fail loud (EIO) instead of reading placeholder zeros")
 	logLevel := flag.String("log-level", "info", "log level")
 	flag.Parse()
 	cmdArgs := flag.Args()
@@ -58,7 +59,10 @@ func main() {
 		log.Error("index fixture", "err", err)
 		os.Exit(1)
 	}
-	store := chunkstoreAdapter{cs}
+	var store desync.Store = chunkstoreAdapter{cs}
+	if *failMaterialize {
+		store = failingStore{} // every GetChunk errors -> every Ensure fails
+	}
 
 	// 2. Skeleton + state table + materializer (reused from S1, unchanged).
 	stateDir, err := os.MkdirTemp("", "mirage-ptrace-state-")
@@ -154,3 +158,14 @@ func (a chunkstoreAdapter) HasChunk(id desync.ChunkID) (bool, error) {
 }
 func (a chunkstoreAdapter) Close() error   { return nil }
 func (a chunkstoreAdapter) String() string { return "fixture-memstore" }
+
+// failingStore is a desync.Store whose every fetch fails — fault injection to
+// prove the tracer fails workspace opens loud (EIO) rather than serving zeros.
+type failingStore struct{}
+
+func (failingStore) GetChunk(id desync.ChunkID) (*desync.Chunk, error) {
+	return nil, fmt.Errorf("injected chunk-fetch failure for %s", id)
+}
+func (failingStore) HasChunk(desync.ChunkID) (bool, error) { return false, nil }
+func (failingStore) Close() error                          { return nil }
+func (failingStore) String() string                        { return "failing-store" }

@@ -111,6 +111,18 @@ cmp /tmp/out.side "$FIX/sub/deep/big.bin" || fail "side-attach: read wrong conte
 grep -q 'errors=0' /tmp/run.err || fail "side-attach: tracer reported errors: $(stats)"
 echo "  side-attach to non-descendant OK — $(stats)"
 
+log "FAIL-LOUD: a materialize failure makes the open fail EIO, never silent zeros (design G3)"
+rm -rf "$ROOT"
+set +e
+"$H" --src "$FIX" --root "$ROOT" --launcher "$BIN/mirage-trace-launcher" --fail-materialize --log-level error \
+    -- "$BIN/static-reader" "$ROOT/sub/deep/big.bin" > /tmp/out.fail 2>/tmp/run.err
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "expected non-zero exit on materialize failure (success => silent zeros leaked)"
+grep -qi 'input/output error' /tmp/run.err || fail "expected an EIO error from the workload; got: $(tail -2 /tmp/run.err)"
+[ ! -s /tmp/out.fail ] || fail "expected EMPTY output on EIO, but the reader produced bytes (zeros leaked)"
+echo "  materialize failure -> EIO, no placeholder zeros leaked"
+
 log "laziness: only the opened file materialized; siblings stay sparse"
 run "$ROOT" /tmp/out.bin -- "$BIN/static-reader" "$ROOT/sub/deep/big.bin"
 [ "$(stat -c %b "$ROOT/sub/deep/big.bin")" -gt 0 ] || fail "opened file not materialized"

@@ -42,10 +42,13 @@ const (
 	ptraceSeize     = 0x4206
 	ptraceInterrupt = 0x4207
 	ptraceCont      = unix.PTRACE_CONT
+	ptraceSyscall   = unix.PTRACE_SYSCALL
 	ptraceDetach    = unix.PTRACE_DETACH
 	ptraceGetRegset = 0x4204
+	ptraceSetRegset = 0x4205
 	ntPrStatus      = 1
 
+	oTraceSysgood = 0x00000001 // mark syscall-stops as SIGTRAP|0x80 (fail-loud path)
 	oTraceFork    = 0x00000002
 	oTraceVfork   = 0x00000004
 	oTraceClone   = 0x00000008
@@ -55,7 +58,7 @@ const (
 	// front-end: mirage-server does not own the workload (the orchestrator
 	// does), so the tracer dying must NOT take the workload down. Without
 	// EXITKILL the kernel auto-detaches and resumes tracees if the tracer exits.
-	seizeOptions = oTraceFork | oTraceVfork | oTraceClone | oTraceExec | oTraceSeccomp
+	seizeOptions = oTraceSysgood | oTraceFork | oTraceVfork | oTraceClone | oTraceExec | oTraceSeccomp
 	eventSeccomp = 7
 	eventExec    = 4
 	pathMaxBytes = 4096
@@ -216,8 +219,10 @@ func (t *Tracer) seizeAll(pid int, traced map[int]bool) error {
 }
 
 // loop is the wait/dispatch loop (runs on the locked thread). traced tracks the
-// live tracee set so a ctx-cancel teardown can detach all of them.
+// live tracee set so a ctx-cancel teardown can detach all of them; failing
+// tracks tracees whose current syscall we are turning into EIO (fail-loud).
 func (t *Tracer) loop(rootPid int, traced map[int]bool) error {
+	failing := map[int]bool{}
 	for {
 		var ws unix.WaitStatus
 		wpid, err := unix.Wait4(-1, &ws, unix.WALL, nil)
@@ -238,6 +243,7 @@ func (t *Tracer) loop(rootPid int, traced map[int]bool) error {
 		switch {
 		case ws.Exited() || ws.Signaled():
 			delete(traced, wpid)
+			delete(failing, wpid)
 			if wpid == rootPid {
 				if ws.Exited() {
 					t.exitCode.Store(int32(ws.ExitStatus()))
@@ -246,7 +252,7 @@ func (t *Tracer) loop(rootPid int, traced map[int]bool) error {
 			}
 		case ws.Stopped():
 			traced[wpid] = true
-			t.onStop(wpid, ws)
+			t.onStop(wpid, ws, failing)
 		}
 	}
 }
@@ -280,14 +286,38 @@ func (t *Tracer) detachAll(traced map[int]bool) {
 
 // onStop dispatches a ptrace stop on the locked thread. The ptrace event (if
 // any) is in bits 16-23 of the raw status.
-func (t *Tracer) onStop(pid int, ws unix.WaitStatus) {
+func (t *Tracer) onStop(pid int, ws unix.WaitStatus, failing map[int]bool) {
 	sig := ws.StopSignal()
 	event := (int(ws) >> 16) & 0xff
+
+	// Second half of the fail-loud sequence: the syscall-EXIT stop of a syscall
+	// we neutralized at entry. Overwrite the return register with -EIO so the
+	// tracee's open()/exec() fails loudly instead of reading placeholder zeros
+	// (design G3). Syscall-stops carry SIGTRAP|0x80 (TRACESYSGOOD).
+	if failing[pid] && event == 0 && (int(sig)&0x7f) == int(unix.SIGTRAP) {
+		delete(failing, pid)
+		if err := setReturn(pid, -int64(unix.EIO)); err != nil {
+			t.log.Error("fail-loud: set EIO return failed", "pid", pid, "err", err)
+		}
+		_ = ptraceContinue(pid, 0)
+		return
+	}
 
 	switch {
 	case sig == unix.SIGTRAP && event == eventSeccomp:
 		t.traps.Add(1)
-		t.handleSeccomp(pid) // materialize before resuming the syscall
+		if err := t.handleSeccomp(pid); err != nil {
+			// Materialize failed. Fail the syscall LOUD: neutralize it at entry
+			// (so the real open/exec never runs against a placeholder), then step
+			// to its exit stop to inject -EIO.
+			if skipSyscall(pid) == nil {
+				if ptraceStep(pid) == nil {
+					failing[pid] = true
+					return
+				}
+			}
+			t.log.Warn("fail-loud unavailable; continuing (open may read placeholder)", "pid", pid)
+		}
 		_ = ptraceContinue(pid, 0)
 	case sig == unix.SIGTRAP && event != 0:
 		// fork/vfork/clone/exec/exit event — child auto-traced; just continue.
@@ -302,37 +332,41 @@ func (t *Tracer) onStop(pid int, ws unix.WaitStatus) {
 }
 
 // handleSeccomp services one open/exec stop: read the path, materialize if it's
-// a workspace file. The syscall is then resumed (continue) by the caller.
-func (t *Tracer) handleSeccomp(pid int) {
+// a workspace file. Returns a non-nil error ONLY when a workspace file failed to
+// materialize (the caller then fails the syscall loud); nil otherwise, including
+// for paths outside the workspace and reads we cannot decode (pass-through).
+func (t *Tracer) handleSeccomp(pid int) error {
 	regs, err := getRegs(pid)
 	if err != nil {
 		t.errs.Add(1)
 		t.log.Debug("getregs failed", "pid", pid, "err", err)
-		return
+		return nil
 	}
 	call, ok := decodeSyscall(sysNR(regs))
 	if !ok {
-		return // not an open/exec we trap (filter/decoder mismatch) — pass through
+		return nil // not an open/exec we trap (filter/decoder mismatch) — pass through
 	}
 	raw, err := readCString(pid, arg(regs, call.pathArg), pathMaxBytes)
 	if err != nil || raw == "" {
 		t.log.Debug("path read failed", "pid", pid, "err", err)
-		return
+		return nil
 	}
 	abs, err := resolvePath(pid, raw, regs, call)
 	if err != nil {
 		t.log.Debug("path resolve failed", "pid", pid, "path", raw, "err", err)
-		return
+		return nil
 	}
 	rel, err := t.mat.RelPath(abs)
 	if err != nil {
-		return // outside the workspace — nothing to do
+		return nil // outside the workspace — nothing to do
 	}
 	t.workspace.Add(1)
 	if err := t.mat.Ensure(rel); err != nil {
 		t.errs.Add(1)
-		t.log.Error("materialize failed", "path", rel, "err", err)
+		t.log.Error("materialize failed; failing the open", "path", rel, "err", err)
+		return err
 	}
+	return nil
 }
 
 // resolvePath turns the raw path argument into an absolute path, handling *at
@@ -385,6 +419,32 @@ func ptraceContinue(pid, sig int) error {
 // interrupt requests a ptrace-stop on a running SEIZEd tracee (PTRACE_INTERRUPT).
 func interrupt(pid int) error {
 	_, _, errno := syscall.Syscall6(syscall.SYS_PTRACE, ptraceInterrupt, uintptr(pid), 0, 0, 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// ptraceStep resumes the tracee until the next syscall-entry/exit stop
+// (PTRACE_SYSCALL). Used to reach the exit stop of a neutralized syscall so its
+// return register can be overwritten with an errno (fail-loud).
+func ptraceStep(pid int) error {
+	_, _, errno := syscall.Syscall6(syscall.SYS_PTRACE, ptraceSyscall, uintptr(pid), 0, 0, 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// setRegset writes a register set (PTRACE_SETREGSET) of the given NT_* type from
+// buf. The arch files use it to neutralize a syscall and to set its return value.
+func setRegset(pid int, regset uintptr, buf []byte) error {
+	if len(buf) == 0 {
+		return fmt.Errorf("ptrace: empty regset buffer")
+	}
+	iov := unix.Iovec{Base: &buf[0], Len: uint64(len(buf))}
+	_, _, errno := syscall.Syscall6(syscall.SYS_PTRACE, ptraceSetRegset, uintptr(pid),
+		regset, uintptr(unsafe.Pointer(&iov)), 0, 0)
 	if errno != 0 {
 		return errno
 	}
